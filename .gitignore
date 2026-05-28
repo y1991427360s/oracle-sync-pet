@@ -1,0 +1,14 @@
+# Local runtime state
+.env
+*.log
+*.tmp
+*.bak
+AGENTS.md
+CLAUDE.md
+
+# Windows / editor noise
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/
