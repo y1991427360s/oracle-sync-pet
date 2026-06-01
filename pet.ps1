@@ -10,7 +10,13 @@ if (-not (Test-Path $stateDir))  { New-Item -ItemType Directory -Path $stateDir 
 if (-not (Test-Path $notifyDir)) { New-Item -ItemType Directory -Path $notifyDir -Force | Out-Null }
 
 # ---------- 打开/激活同步文件夹 ----------
-Add-Type @"
+# Win32 P/Invoke 类型只在"点击打开文件夹"时才用得到。Add-Type 底层会拉起 csc.exe
+# 编译，在冷启动时要花一两秒。把它推迟到第一次真正用到时再编译，能明显缩短开机后
+# 桌宠出现的时间。
+$script:win32Ready = $false
+function Initialize-Win32 {
+    if ($script:win32Ready) { return }
+    Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 public static class Win32 {
@@ -23,8 +29,11 @@ public static class Win32 {
     [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
 }
 "@
+    $script:win32Ready = $true
+}
 
 function Open-SyncFolder {
+    Initialize-Win32
     $shell = New-Object -ComObject Shell.Application
     $found = $null
     foreach ($w in $shell.Windows()) {
@@ -51,7 +60,8 @@ function Open-SyncFolder {
 }
 
 # ---------- 加载位置 ----------
-$pos = [pscustomobject]@{ Left = 200.0; Top = 200.0 }
+# 默认屏幕中央（实际位置在窗口创建后调整）
+$pos = [pscustomobject]@{ Left = 960.0; Top = 540.0 }
 if (Test-Path $stateFile) {
     try { $pos = Get-Content $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
 }
@@ -411,71 +421,74 @@ function Get-HumanBytes([long]$n) {
     return ('{0:N2} GB' -f ($n / 1GB))
 }
 
-function Poll-SyncStatus {
-    if (-not $script:syncApiKey -or -not $script:syncFolderId) {
-        Set-StatusDot 'unknown' '未找到 Syncthing 配置'
-        return @{ kind = 'unknown' }
+# ---- 后台轮询：网络 I/O 放到独立 runspace，绝不阻塞 UI 线程 ----
+# 旧版在 UI 线程上同步调用 REST：开机时 Syncthing 正忙着做自己的启动扫描、响应很慢，
+# 三个请求最坏要等 6 秒，期间桌宠窗口卡住出不来——这就是"开机扫描很慢"的根因。
+# 现在改成后台线程拉数据，主线程只在 Tick 时收割结果刷新小圆点，彻底消除卡顿。
+$script:syncLast   = @{ kind = 'unknown'; tip = '检测中…' }
+$script:pollPS     = $null
+$script:pollHandle = $null
+
+# 纯网络逻辑，运行在后台 runspace 里。绝不能碰任何 WPF 对象，只返回原始数据哈希表。
+$pollScript = {
+    param($apiKey, $folderId)
+    function Test-Port {
+        try {
+            $c = New-Object System.Net.Sockets.TcpClient
+            $ar = $c.BeginConnect('127.0.0.1', 8384, $null, $null)
+            $ok = $ar.AsyncWaitHandle.WaitOne(300)
+            if ($ok -and $c.Connected) { $c.EndConnect($ar); $c.Close(); return $true }
+            $c.Close(); return $false
+        } catch { return $false }
     }
-    if (-not (Test-SyncthingPort)) {
-        Set-StatusDot 'error' 'Syncthing 未运行（127.0.0.1:8384 无响应）'
-        return @{ kind = 'offline' }
-    }
-    $headers = @{ 'X-API-Key' = $script:syncApiKey }
+    if (-not $apiKey -or -not $folderId) { return @{ kind = 'unknown'; tip = '未找到 Syncthing 配置' } }
+    if (-not (Test-Port))                { return @{ kind = 'offline'; tip = 'Syncthing 未运行（127.0.0.1:8384 无响应）' } }
+    $headers = @{ 'X-API-Key' = $apiKey }
     try {
-        $fcfg = Invoke-RestMethod -Uri "http://127.0.0.1:8384/rest/config/folders/$($script:syncFolderId)" -Headers $headers -TimeoutSec 2
-    } catch {
-        Set-StatusDot 'error' ("Syncthing 无响应：" + $_.Exception.Message)
-        return @{ kind = 'error' }
-    }
-    if ($fcfg.paused) {
-        $tip = '已暂停同步（右键 → 暂停 / 恢复同步 可恢复）'
-        Set-StatusDot 'paused' $tip
-        return @{ kind = 'paused'; tip = $tip }
-    }
+        $fcfg = Invoke-RestMethod -Uri "http://127.0.0.1:8384/rest/config/folders/$folderId" -Headers $headers -TimeoutSec 2
+    } catch { return @{ kind = 'error'; tip = ('Syncthing 无响应：' + $_.Exception.Message) } }
+    if ($fcfg.paused) { return @{ kind = 'paused'; tip = '已暂停同步（右键 → 暂停 / 恢复同步 可恢复）' } }
     try {
-        $st = Invoke-RestMethod -Uri "http://127.0.0.1:8384/rest/db/status?folder=$($script:syncFolderId)" -Headers $headers -TimeoutSec 2
+        $st = Invoke-RestMethod -Uri "http://127.0.0.1:8384/rest/db/status?folder=$folderId" -Headers $headers -TimeoutSec 2
         $cn = Invoke-RestMethod -Uri 'http://127.0.0.1:8384/rest/system/connections' -Headers $headers -TimeoutSec 2
-    } catch {
-        Set-StatusDot 'error' ("Syncthing 无响应：" + $_.Exception.Message)
-        return @{ kind = 'error' }
-    }
-    $state = [string]$st.state
-    $needB = [long]($st.needBytes)
-    $needF = [int]($st.needFiles + $st.needDirectories + $st.needSymlinks + $st.needDeletes)
+    } catch { return @{ kind = 'error'; tip = ('Syncthing 无响应：' + $_.Exception.Message) } }
     $connected = 0
     if ($cn.connections) {
-        foreach ($p in $cn.connections.PSObject.Properties) {
-            if ($p.Value.connected) { $connected++ }
-        }
+        foreach ($p in $cn.connections.PSObject.Properties) { if ($p.Value.connected) { $connected++ } }
     }
-    $kind = 'unknown'; $tip = ''
-    if ($state -eq 'syncing' -or $state -eq 'scanning') {
-        $kind = 'sync'
-        $label = if ($state -eq 'scanning') { '扫描中' } else { '同步中' }
-        if ($needB -gt 0 -or $needF -gt 0) {
-            $tip = "$label · 剩 $(Get-HumanBytes $needB) / $needF 项"
-        } else {
-            $tip = "$label…"
-        }
-    } elseif ($state -eq 'error') {
-        $kind = 'error'; $tip = "同步出错：$($st.error)"
-    } elseif ($needB -gt 0 -or $needF -gt 0) {
-        $kind = 'sync'
-        $tip = "等待同步 · 剩 $(Get-HumanBytes $needB) / $needF 项"
-    } else {
-        if ($connected -gt 0) {
-            $kind = 'ok'; $tip = "已同步 · 与 $connected 台设备相连"
-        } else {
-            $kind = 'warn'; $tip = '已同步 · 暂无对端在线'
-        }
+    return @{
+        state     = [string]$st.state
+        needBytes = [long]$st.needBytes
+        needFiles = [int]($st.needFiles + $st.needDirectories + $st.needSymlinks + $st.needDeletes)
+        connected = $connected
+        error     = [string]$st.error
     }
-    Set-StatusDot $kind $tip
-    return @{ kind = $kind; tip = $tip; needBytes = $needB; needFiles = $needF; connected = $connected; state = $state }
 }
 
-function Update-SyncStatus {
-    $cur = Poll-SyncStatus
-    $k = $cur.kind
+# 把后台返回的原始数据翻译成 kind + tip（运行在 UI 线程）。
+function Resolve-SyncKind($r) {
+    if ($r.ContainsKey('kind')) { return $r }   # 已是终态：unknown / offline / paused / error
+    $needB = [long]$r.needBytes; $needF = [int]$r.needFiles; $state = [string]$r.state
+    if ($state -eq 'syncing' -or $state -eq 'scanning') {
+        $label = if ($state -eq 'scanning') { '扫描中' } else { '同步中' }
+        $tip = if ($needB -gt 0 -or $needF -gt 0) { "$label · 剩 $(Get-HumanBytes $needB) / $needF 项" } else { "$label…" }
+        return @{ kind = 'sync'; tip = $tip }
+    } elseif ($state -eq 'error') {
+        return @{ kind = 'error'; tip = "同步出错：$($r.error)" }
+    } elseif ($needB -gt 0 -or $needF -gt 0) {
+        return @{ kind = 'sync'; tip = "等待同步 · 剩 $(Get-HumanBytes $needB) / $needF 项" }
+    } elseif ([int]$r.connected -gt 0) {
+        return @{ kind = 'ok'; tip = "已同步 · 与 $($r.connected) 台设备相连" }
+    } else {
+        return @{ kind = 'warn'; tip = '已同步 · 暂无对端在线' }
+    }
+}
+
+# 拿到一次轮询结果后刷新小圆点，并在状态变化时弹气泡（运行在 UI 线程）。
+function Apply-SyncResult($raw) {
+    $res = Resolve-SyncKind $raw
+    $k = $res.kind
+    Set-StatusDot $k $res.tip
     $prev = $script:syncLastKind
     if ($prev -and $prev -ne $k) {
         switch ("$prev->$k") {
@@ -494,25 +507,50 @@ function Update-SyncStatus {
         }
     }
     $script:syncLastKind = $k
+    $script:syncLast = $res
+}
+
+# 每个 Tick：先收割上一次后台轮询的结果（若已完成），再视情况启动下一次。
+# UI 线程在这里绝不等待网络——只看 IsCompleted，没好就下次再来。
+function Pump-SyncPoll {
+    if ($script:pollHandle -and $script:pollHandle.IsCompleted) {
+        try {
+            $out = $script:pollPS.EndInvoke($script:pollHandle)
+            $raw = $out | Select-Object -Last 1
+            if ($raw) { Apply-SyncResult $raw }
+        } catch { try { Set-StatusDot 'unknown' ('状态轮询异常：' + $_.Exception.Message) } catch {} }
+        finally {
+            try { $script:pollPS.Dispose() } catch {}
+            $script:pollPS = $null; $script:pollHandle = $null
+        }
+    }
+    if (-not $script:pollHandle) {
+        try {
+            $script:pollPS = [PowerShell]::Create()
+            [void]$script:pollPS.AddScript($pollScript).AddArgument($script:syncApiKey).AddArgument($script:syncFolderId)
+            $script:pollHandle = $script:pollPS.BeginInvoke()
+        } catch { $script:pollPS = $null; $script:pollHandle = $null }
+    }
 }
 
 $syncTimer = New-Object System.Windows.Threading.DispatcherTimer
-$syncTimer.Interval = [TimeSpan]::FromSeconds(5)
+$syncTimer.Interval = [TimeSpan]::FromSeconds(3)
 $syncTimer.Add_Tick({
     # 单次 Tick 异常不能让 DispatcherTimer 静默停掉——否则状态就永远卡在上一次值。
-    try { Update-SyncStatus }
+    try { Pump-SyncPoll }
     catch { try { Set-StatusDot 'unknown' ("状态轮询异常：" + $_.Exception.Message) } catch {} }
 })
-# 启动时先跑一次（不弹"完成"气泡）
-$win.Add_SourceInitialized({
-    try { Update-SyncStatus } catch {}
+# 窗口内容渲染完成后再启动轮询：先让桌宠瞬间出现，不被网络请求拖住开机。
+$win.Add_ContentRendered({
+    try { Pump-SyncPoll } catch {}   # 立刻发起第一次轮询（后台线程，不阻塞）
     $syncTimer.Start()
 })
 
-# 右键菜单"查看同步状态"
+# 右键菜单"查看同步状态"——显示最近一次后台轮询的缓存结果，并顺手触发一次刷新
 $miSync.Add_Click({
-    $cur = Poll-SyncStatus
-    if ($cur.tip) { Show-Bubble $cur.tip } else { Show-Bubble 'Syncthing 状态：未知' }
+    if ($script:syncLast -and $script:syncLast.tip) { Show-Bubble $script:syncLast.tip }
+    else { Show-Bubble 'Syncthing 状态：检测中…' }
+    try { Pump-SyncPoll } catch {}
 })
 
 # 右键菜单"暂停 / 恢复同步"——根据当前是否暂停切换
@@ -532,7 +570,7 @@ $miPause.Add_Click({
         $body = (@{ paused = $newPaused } | ConvertTo-Json -Compress)
         Invoke-RestMethod -Method Patch -Uri "http://127.0.0.1:8384/rest/config/folders/$($script:syncFolderId)" -Headers $headers -Body $body -TimeoutSec 3 | Out-Null
         if ($newPaused) { Show-Bubble '⏸ 已暂停 Oracle-Sync 同步' } else { Show-Bubble '▶ 已恢复 Oracle-Sync 同步' }
-        Update-SyncStatus
+        try { Pump-SyncPoll } catch {}
     } catch {
         Show-Bubble ("切换失败：" + $_.Exception.Message)
     }
