@@ -540,10 +540,32 @@ $syncTimer.Add_Tick({
     try { Pump-SyncPoll }
     catch { try { Set-StatusDot 'unknown' ("状态轮询异常：" + $_.Exception.Message) } catch {} }
 })
+
+# ---------- 强制置顶：定时把桌宠顶回最上层 ----------
+# XAML 的 Topmost=True 只在"出生时"把窗口放进置顶层。之后前台争夺、其它置顶程序、
+# 分辨率/显示器变化、锁屏解锁等会把它挤出置顶层——即便 WPF 的 Topmost 属性仍是 True，
+# 窗口实际的 WS_EX_TOPMOST 位也可能被系统清掉（已实测复现），桌宠就被别的窗口盖住，
+# 这就是"有时候不会置顶"的根因。
+# 修复：把 WPF 的 Topmost 走一遍 false→true，强制 WPF 重新申请置顶（已实测能把被挤掉的
+# 窗口顶回去）。不直接用 SetWindowPos——WPF 的窗口过程会按自己的 Topmost 属性纠正外部
+# 的 Z 序改动，实测 SetWindowPos 单独调用不生效。纯属性切换零编译开销，不拖慢开机。
+function Set-AlwaysOnTop {
+    # 拖动中 / 气泡或右键菜单开着时不切换：切 Topmost 会瞬间打断这些 Popup（右键菜单还会被关掉）。
+    if ($win.IsMouseCaptured -or $bubble.IsOpen -or $menu.IsOpen) { return }
+    $win.Topmost = $false
+    $win.Topmost = $true
+}
+$topmostTimer = New-Object System.Windows.Threading.DispatcherTimer
+$topmostTimer.Interval = [TimeSpan]::FromSeconds(2)
+$topmostTimer.Add_Tick({ try { Set-AlwaysOnTop } catch {} })
+# 桌宠一旦失去前台（多半是别的窗口冒到前面），立刻顶回去，恢复更跟手。
+$win.Add_Deactivated({ try { Set-AlwaysOnTop } catch {} })
+
 # 窗口内容渲染完成后再启动轮询：先让桌宠瞬间出现，不被网络请求拖住开机。
 $win.Add_ContentRendered({
     try { Pump-SyncPoll } catch {}   # 立刻发起第一次轮询（后台线程，不阻塞）
     $syncTimer.Start()
+    $topmostTimer.Start()
 })
 
 # 右键菜单"查看同步状态"——显示最近一次后台轮询的缓存结果，并顺手触发一次刷新
