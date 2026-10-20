@@ -1,4 +1,6 @@
-﻿Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+﻿param([switch]$WaterPreview)
+
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
 $ErrorActionPreference = 'Stop'
 $root      = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path.TrimEnd('\')
@@ -8,6 +10,19 @@ $stateFile = Join-Path $stateDir 'state.json'
 $notifyDir = Join-Path $stateDir 'notify'
 if (-not (Test-Path $stateDir))  { New-Item -ItemType Directory -Path $stateDir  -Force | Out-Null }
 if (-not (Test-Path $notifyDir)) { New-Item -ItemType Directory -Path $notifyDir -Force | Out-Null }
+
+# ---------- 退出原因日志 ----------
+# 记录每次进程为什么结束：菜单退出 / 窗口关闭 / 未处理异常 / 进程正常退出。
+# 若只有"启动"没有任何退出记录，说明进程是被外部强制结束（TerminateProcess），无法被脚本捕获。
+$exitLog = Join-Path $stateDir 'exit.log'
+function Write-ExitLog([string]$msg) {
+    try {
+        $line = "{0}  pid={1}  {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $PID, $msg
+        Add-Content -Path $exitLog -Value $line -Encoding UTF8
+    } catch {}
+}
+Write-ExitLog 'start'
+[AppDomain]::CurrentDomain.add_ProcessExit({ Write-ExitLog 'process exit (normal)' })
 
 # ---------- 打开/激活同步文件夹 ----------
 # Win32 P/Invoke 类型只在"点击打开文件夹"时才用得到。Add-Type 底层会拉起 csc.exe
@@ -75,7 +90,11 @@ $transformBlock = @"
         <TranslateTransform x:Name="PetTrans"   X="0" Y="0"/>
       </TransformGroup>
 "@
+# 不同形象的可见主体位置不同：pet.png 上下各有透明留白，阴影、状态点、气泡都贴着可见主体放。
 if (Test-Path $petPng) {
+    $shadowXaml   = 'VerticalAlignment="Top" Margin="0,69,0,0"'
+    $dotXaml      = 'HorizontalAlignment="Left" VerticalAlignment="Top" Margin="74,54,0,0"'
+    $bubbleOffset = 20
     $bodyXaml = @"
     <Image x:Name="Pet" Source="$([Uri]::new($petPng).AbsoluteUri)" Width="96" Height="96" Cursor="Hand"
            RenderTransformOrigin="0.5,0.5">
@@ -83,6 +102,9 @@ if (Test-Path $petPng) {
     </Image>
 "@
 } else {
+    $shadowXaml   = 'VerticalAlignment="Bottom" Margin="0,0,0,-4"'
+    $dotXaml      = 'HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="0,0,2,2"'
+    $bubbleOffset = -4
     $bodyXaml = @"
     <TextBlock x:Name="Pet" Text="&#x1F430;" FontSize="80" FontFamily="Segoe UI Emoji" Cursor="Hand"
                RenderTransformOrigin="0.5,0.5">
@@ -96,33 +118,142 @@ $xaml = @"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         Topmost="True" ShowInTaskbar="False" SizeToContent="WidthAndHeight"
-        Title="OracleSyncPet" ToolTip="左键拖动 / 点击打开 Oracle-Sync / 右键菜单">
+        Title="OracleSyncPet" ToolTip="左键拖动 · 点击打开 Oracle-Sync · 右键菜单">
+  <Window.Resources>
+    <!-- 统一的深色圆角提示框（窗口提示与状态点提示共用） -->
+    <Style TargetType="ToolTip">
+      <Setter Property="HasDropShadow" Value="False"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ToolTip">
+            <Border Background="#F0262B33" CornerRadius="7" Padding="10,6" Margin="8">
+              <Border.Effect>
+                <DropShadowEffect BlurRadius="10" ShadowDepth="2" Opacity="0.3"/>
+              </Border.Effect>
+              <ContentPresenter TextBlock.Foreground="#FFF5F6F8" TextBlock.FontSize="12"
+                                TextBlock.FontFamily="Microsoft YaHei UI, Segoe UI Emoji"/>
+            </Border>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
   <Grid Margin="8">
+    <Ellipse x:Name="GroundShadow" Width="64" Height="12" HorizontalAlignment="Center"
+             $shadowXaml IsHitTestVisible="False" RenderTransformOrigin="0.5,0.5">
+      <Ellipse.Fill>
+        <RadialGradientBrush>
+          <GradientStop Color="#40000000" Offset="0"/>
+          <GradientStop Color="#00000000" Offset="1"/>
+        </RadialGradientBrush>
+      </Ellipse.Fill>
+      <Ellipse.RenderTransform><ScaleTransform x:Name="ShadowScale" ScaleX="1" ScaleY="1"/></Ellipse.RenderTransform>
+    </Ellipse>
     $bodyXaml
-    <Ellipse x:Name="StatusDot" Width="18" Height="18"
-             HorizontalAlignment="Right" VerticalAlignment="Bottom"
-             Margin="0,0,2,2" Fill="#FF9E9E9E" Stroke="White" StrokeThickness="2"
+    <Ellipse x:Name="StatusDot" Width="16" Height="16" $dotXaml
+             Fill="#FF9E9E9E" Stroke="White" StrokeThickness="2.5"
              ToolTip="Syncthing 状态：检测中…">
       <Ellipse.Effect>
-        <DropShadowEffect BlurRadius="6" ShadowDepth="1" Opacity="0.55"/>
+        <DropShadowEffect BlurRadius="5" ShadowDepth="1" Opacity="0.4"/>
       </Ellipse.Effect>
     </Ellipse>
     <Popup x:Name="Bubble" PlacementTarget="{Binding ElementName=Pet}" Placement="Top"
-           AllowsTransparency="True" StaysOpen="True" VerticalOffset="-4" HorizontalOffset="0"
+           AllowsTransparency="True" StaysOpen="True" VerticalOffset="$bubbleOffset" HorizontalOffset="0"
            PopupAnimation="Fade">
-      <Border x:Name="BubbleBorder" Background="#FFFFFAF0" BorderBrush="#FFE0C97A"
-              BorderThickness="1.5" CornerRadius="12" Padding="12,8" MaxWidth="240"
-              Cursor="Hand">
-        <Border.Effect>
-          <DropShadowEffect BlurRadius="10" ShadowDepth="2" Opacity="0.35"/>
-        </Border.Effect>
-        <TextBlock x:Name="BubbleText" FontFamily="Segoe UI Emoji, Microsoft YaHei UI"
-                   FontSize="14" Foreground="#FF4A3A1B" TextWrapping="Wrap"
-                   Text="该喝水啦 💧"/>
-      </Border>
+      <!-- 外层留白给阴影；气泡主体 + 底部小尾巴共用一个阴影 -->
+      <StackPanel x:Name="BubbleRoot" Margin="12,10,12,6" Cursor="Hand">
+        <StackPanel.Effect>
+          <DropShadowEffect BlurRadius="12" ShadowDepth="2" Direction="270" Opacity="0.22"/>
+        </StackPanel.Effect>
+        <Border x:Name="BubbleBorder" Background="#FFFFFCF5" BorderBrush="#FFEBDDBA"
+                BorderThickness="1" CornerRadius="14" Padding="14,9,14,8" MaxWidth="260" MinWidth="80">
+          <StackPanel>
+            <TextBlock x:Name="BubbleText" FontFamily="Microsoft YaHei UI, Segoe UI Emoji"
+                       FontSize="13.5" Foreground="#FF3D3424" TextWrapping="Wrap" LineHeight="20"
+                       Text="该喝水啦 💧"/>
+            <TextBlock Text="点击收起" FontFamily="Microsoft YaHei UI" FontSize="10.5"
+                       Foreground="#FFB3A57E" HorizontalAlignment="Right" Margin="0,3,0,0"/>
+          </StackPanel>
+        </Border>
+        <Path Data="M0,0 L8,8 L16,0" Fill="#FFFFFCF5" Stroke="#FFEBDDBA" StrokeThickness="1"
+              HorizontalAlignment="Center" Margin="0,-1,0,0"/>
+      </StackPanel>
     </Popup>
   </Grid>
 </Window>
+"@
+
+# 右键菜单：圆角卡片 + 图标列 + 悬停高亮，替换 WPF 默认的老式菜单外观。
+# 图标用系统自带的 Segoe MDL2 Assets 字体，菜单项的 Icon 属性直接放字形字符。
+$menuXaml = @"
+<ContextMenu xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             HasDropShadow="False">
+  <ContextMenu.Template>
+    <ControlTemplate TargetType="ContextMenu">
+      <Border Background="#FFFFFFFF" BorderBrush="#FFE4E6EB" BorderThickness="1"
+              CornerRadius="10" Padding="0,5" Margin="10" MinWidth="200">
+        <Border.Effect>
+          <DropShadowEffect BlurRadius="16" ShadowDepth="3" Direction="270" Opacity="0.18"/>
+        </Border.Effect>
+        <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Cycle"/>
+      </Border>
+    </ControlTemplate>
+  </ContextMenu.Template>
+  <ContextMenu.Resources>
+    <Style TargetType="MenuItem">
+      <Setter Property="Foreground" Value="#FF1F2329"/>
+      <Setter Property="FontFamily" Value="Microsoft YaHei UI"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="MenuItem">
+            <Border x:Name="Bd" Background="Transparent" CornerRadius="6" Margin="5,1" Padding="10,7,16,7">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="26"/>
+                  <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock x:Name="Ico" Text="{Binding Icon, RelativeSource={RelativeSource TemplatedParent}}"
+                           FontFamily="Segoe MDL2 Assets" FontSize="14" Foreground="#FF6B7280"
+                           VerticalAlignment="Center"/>
+                <ContentPresenter Grid.Column="1" ContentSource="Header" RecognizesAccessKey="True"
+                                  VerticalAlignment="Center"/>
+              </Grid>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsHighlighted" Value="True">
+                <Setter TargetName="Bd" Property="Background" Value="#FFF1F3F6"/>
+                <Setter TargetName="Ico" Property="Foreground" Value="#FF3B82F6"/>
+              </Trigger>
+              <MultiTrigger>
+                <MultiTrigger.Conditions>
+                  <Condition Property="IsHighlighted" Value="True"/>
+                  <Condition Property="Tag" Value="danger"/>
+                </MultiTrigger.Conditions>
+                <Setter TargetName="Bd" Property="Background" Value="#FFFDECEC"/>
+                <Setter TargetName="Ico" Property="Foreground" Value="#FFE53935"/>
+                <Setter Property="Foreground" Value="#FFD32F2F"/>
+              </MultiTrigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Opacity" Value="0.4"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="{x:Static MenuItem.SeparatorStyleKey}" TargetType="Separator">
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Separator">
+            <Border Height="1" Background="#FFECEEF1" Margin="12,4"/>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </ContextMenu.Resources>
+</ContextMenu>
 "@
 
 $reader = New-Object System.Xml.XmlNodeReader ([xml]$xaml)
@@ -139,6 +270,13 @@ $bubble      = $win.FindName('Bubble')
 $bubbleText  = $win.FindName('BubbleText')
 $bubbleBorder= $win.FindName('BubbleBorder')
 $statusDot   = $win.FindName('StatusDot')
+$bubbleRoot  = $win.FindName('BubbleRoot')
+$shadowScale = $win.FindName('ShadowScale')
+
+# Placement=Top 只对齐左边缘；按气泡实际宽度算偏移，让尾巴正对桌宠中线。
+$bubbleRoot.Add_SizeChanged({
+    $bubble.HorizontalOffset = ($pet.ActualWidth - $bubbleRoot.ActualWidth) / 2
+})
 
 # ---------- 拖动 vs 点击 ----------
 $script:startMouse = $null
@@ -194,34 +332,47 @@ $pet.Add_MouseLeave({
 })
 
 # ---------- 右键菜单 ----------
-$menu = New-Object System.Windows.Controls.ContextMenu
-$miOpen = New-Object System.Windows.Controls.MenuItem; $miOpen.Header = '打开 Oracle-Sync'
+$menu = [Windows.Markup.XamlReader]::Parse($menuXaml)
+function New-MenuItem([string]$header, [int]$glyph) {
+    $mi = New-Object System.Windows.Controls.MenuItem
+    $mi.Header = $header
+    $mi.Icon   = [string][char]$glyph
+    return $mi
+}
+$miOpen = New-MenuItem '打开 Oracle-Sync' 0xE838
 $miOpen.Add_Click({ Open-SyncFolder })
-$miReset = New-Object System.Windows.Controls.MenuItem; $miReset.Header = '回到屏幕中央'
+$miReset = New-MenuItem '回到屏幕中央' 0xE81D
 $miReset.Add_Click({
     $win.Left = ([System.Windows.SystemParameters]::PrimaryScreenWidth  - $win.ActualWidth)  / 2
     $win.Top  = ([System.Windows.SystemParameters]::PrimaryScreenHeight - $win.ActualHeight) / 2
     @{ Left = $win.Left; Top = $win.Top } | ConvertTo-Json | Set-Content -Path $stateFile -Encoding UTF8
 })
-$miExit = New-Object System.Windows.Controls.MenuItem; $miExit.Header = '退出桌宠'
+$miExit = New-MenuItem '退出桌宠' 0xE7E8
+$miExit.Tag = 'danger'
 $miExit.Add_Click({ $win.Close() })
-$miWater = New-Object System.Windows.Controls.MenuItem; $miWater.Header = '立即提醒喝水'
-$miSync  = New-Object System.Windows.Controls.MenuItem; $miSync.Header  = '查看同步状态'
-$miPause = New-Object System.Windows.Controls.MenuItem; $miPause.Header = '暂停 / 恢复同步'
+$miWater = New-MenuItem '立即提醒喝水' 0xE916
+$miSync  = New-MenuItem '查看同步状态' 0xE895
+$miPause = New-MenuItem '暂停同步' 0xE769
+$miWaterDone = New-MenuItem '已喝水，恢复显示' 0xE73E
+$miWaterDone.IsEnabled = $false
 [void]$menu.Items.Add($miOpen)
 [void]$menu.Items.Add((New-Object System.Windows.Controls.Separator))
 [void]$menu.Items.Add($miSync)
 [void]$menu.Items.Add($miPause)
-[void]$menu.Items.Add($miReset)
+[void]$menu.Items.Add((New-Object System.Windows.Controls.Separator))
 [void]$menu.Items.Add($miWater)
+[void]$menu.Items.Add($miWaterDone)
+[void]$menu.Items.Add((New-Object System.Windows.Controls.Separator))
+[void]$menu.Items.Add($miReset)
 [void]$menu.Items.Add($miExit)
 $win.ContextMenu = $menu
 
 # ---------- 闲置时的呼吸动画 ----------
 $breathe = New-Object System.Windows.Media.Animation.DoubleAnimation
-$breathe.From = 1.0; $breathe.To = 1.12
+$breathe.From = 1.0; $breathe.To = 1.06
 $breathe.Duration = [System.Windows.Duration]([TimeSpan]::FromSeconds(2))
 $breathe.AutoReverse = $true
+$breathe.EasingFunction = New-Object System.Windows.Media.Animation.SineEase -Property @{ EasingMode = 'EaseInOut' }
 $breathe.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
 $petScale.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleXProperty, $breathe)
 $petScale.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleYProperty, $breathe)
@@ -236,6 +387,12 @@ function Hop {
     $a.AutoReverse = $true
     $a.EasingFunction = New-Object System.Windows.Media.Animation.QuadraticEase -Property @{ EasingMode = 'EaseOut' }
     $petTrans.BeginAnimation([System.Windows.Media.TranslateTransform]::YProperty, $a)
+    # 跳起时地面阴影同步缩小变淡
+    $s = New-Object System.Windows.Media.Animation.DoubleAnimation 1.0, 0.6, ([TimeSpan]::FromMilliseconds(220))
+    $s.AutoReverse = $true
+    $s.EasingFunction = $a.EasingFunction
+    $shadowScale.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleXProperty, $s)
+    $shadowScale.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleYProperty, $s)
 }
 function Wiggle {
     $a = New-Object System.Windows.Media.Animation.DoubleAnimation -18, 18, ([TimeSpan]::FromMilliseconds(140))
@@ -282,8 +439,10 @@ $timer.Add_Tick({
 })
 $timer.Start()
 
-# ---------- 喝水提醒气泡 ----------
-function Show-Bubble([string]$text, [int]$seconds = 0) {
+# ---------- 通用通知气泡 ----------
+$script:bubbleSource = $null
+function Show-Bubble([string]$text, [int]$seconds = 0, [string]$source = 'notification') {
+    $script:bubbleSource = $source
     $bubbleText.Text = $text
     $bubble.IsOpen = $true
     Hop  # 蹦一下吸引注意
@@ -296,14 +455,108 @@ $bubbleBorder.Add_MouseLeftButtonDown({
     $_.Handled = $true
 })
 
-$waterMessages = @(
-    '该喝水啦 💧 起来活动一下吧～',
-    '咕嘟咕嘟～该喝口水了 🥤',
-    '40 分钟到啦，记得补水哦 💦',
-    '提醒一下：喝水时间到 ☕'
-)
+# ---------- 喝水滤镜：原生分层窗口，按物理像素覆盖每块显示器 ----------
+# 不修改系统颜色设置；窗口透明且不激活，保留鼠标穿透。
+function Initialize-WaterFilter {
+    if ('OracleWaterFilter' -as [type]) { return }
+    Add-Type @"
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class OracleWaterFilter {
+    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct WNDCLASS {
+        public uint style; public IntPtr proc; public int clsExtra, wndExtra;
+        public IntPtr instance, icon, cursor, background;
+        public string menu, name;
+    }
+    delegate IntPtr WindowProc(IntPtr h, uint msg, IntPtr w, IntPtr l);
+    delegate bool MonitorProc(IntPtr monitor, IntPtr dc, ref RECT rect, IntPtr data);
+    static readonly WindowProc proc = WndProc;
+    static readonly List<IntPtr> windows = new List<IntPtr>();
+    static List<RECT> bounds = new List<RECT>();
+    static ushort atom;
+    static IntPtr brush;
+    const uint Styles = 0x00080000 | 0x00000020 | 0x08000000 | 0x00000080 | 0x00000008;
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern ushort RegisterClassW(ref WNDCLASS c);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr CreateWindowExW(uint ex, string cls, string title, uint style, int x, int y, int width, int height, IntPtr parent, IntPtr menu, IntPtr instance, IntPtr param);
+    [DllImport("user32.dll")] static extern IntPtr DefWindowProcW(IntPtr h, uint m, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] static extern bool DestroyWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool SetLayeredWindowAttributes(IntPtr h, uint key, byte alpha, uint flags);
+    [DllImport("user32.dll", SetLastError=true)] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int height, uint flags);
+    [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(IntPtr dc, IntPtr clip, MonitorProc callback, IntPtr data);
+    [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll", EntryPoint="GetWindowLongW")] public static extern int GetWindowLong(IntPtr h, int index);
+    [DllImport("user32.dll")] public static extern bool GetLayeredWindowAttributes(IntPtr h, out uint key, out byte alpha, out uint flags);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("gdi32.dll")] static extern IntPtr CreateSolidBrush(uint color);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern IntPtr GetModuleHandleW(string name);
+    static IntPtr WndProc(IntPtr h, uint msg, IntPtr w, IntPtr l) {
+        if (msg == 0x0084) return new IntPtr(-1); // HTTRANSPARENT
+        if (msg == 0x0021) return new IntPtr(3);  // MA_NOACTIVATE
+        return DefWindowProcW(h, msg, w, l);
+    }
+    static List<RECT> Screens() {
+        var result = new List<RECT>();
+        if (!EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero,
+            delegate(IntPtr m, IntPtr dc, ref RECT r, IntPtr data) { result.Add(r); return true; }, IntPtr.Zero))
+            throw new Win32Exception();
+        return result;
+    }
+    public static IntPtr[] Handles { get { return windows.ToArray(); } }
+    public static RECT[] MonitorBounds { get { return bounds.ToArray(); } }
+    public static void Show() {
+        IntPtr old = SetThreadDpiAwarenessContext(new IntPtr(-4));
+        try {
+            var screens = Screens();
+            bool same = screens.Count == bounds.Count && windows.Count == screens.Count;
+            for (int i=0; same && i<screens.Count; i++)
+                same = screens[i].Equals(bounds[i]) && IsWindow(windows[i]);
+            if (!same) {
+                Hide();
+                if (atom == 0) {
+                    // COLORREF 0x00BBGGRR，对应 #409CFF。
+                    brush = CreateSolidBrush(0x00FF9C40);
+                    if (brush == IntPtr.Zero) throw new Win32Exception();
+                    var c = new WNDCLASS { proc=Marshal.GetFunctionPointerForDelegate(proc),
+                        instance=GetModuleHandleW(null), background=brush, name="OracleSyncWaterOverlay" };
+                    atom = RegisterClassW(ref c);
+                    if (atom == 0) throw new Win32Exception();
+                }
+                foreach (var r in screens) {
+                    IntPtr h = CreateWindowExW(Styles, "OracleSyncWaterOverlay", "OracleSyncWaterFilter", 0x80000000,
+                        r.Left, r.Top, r.Right-r.Left, r.Bottom-r.Top, IntPtr.Zero, IntPtr.Zero, GetModuleHandleW(null), IntPtr.Zero);
+                    if (h == IntPtr.Zero) throw new Win32Exception();
+                    windows.Add(h);
+                    if (!SetLayeredWindowAttributes(h, 0, 51, 2)) throw new Win32Exception();
+                }
+                bounds = screens;
+            }
+            for (int i=0; i<windows.Count; i++) {
+                var r = bounds[i];
+                // HWND_TOPMOST + SWP_NOACTIVATE + SWP_SHOWWINDOW；坐标不经过 WPF 的 DIP 转换。
+                if (!SetWindowPos(windows[i], new IntPtr(-1), r.Left, r.Top, r.Right-r.Left, r.Bottom-r.Top, 0x0050))
+                    throw new Win32Exception();
+            }
+        } catch { Hide(); throw; }
+        finally { if (old != IntPtr.Zero) SetThreadDpiAwarenessContext(old); }
+    }
+    public static void Hide() {
+        foreach (IntPtr h in windows) DestroyWindow(h);
+        windows.Clear(); bounds.Clear();
+    }
+}
+"@
+}
+
+$script:waterActive = $false
 $waterTimer = New-Object System.Windows.Threading.DispatcherTimer
 $waterTimer.Interval = [TimeSpan]::FromMinutes(30)
+$waterFilterTimer = New-Object System.Windows.Threading.DispatcherTimer
+$waterFilterTimer.Interval = [TimeSpan]::FromSeconds(2)
 $waterLog = Join-Path $stateDir 'water.log'
 function Write-WaterLog([string]$event, [string]$msg = '') {
     try {
@@ -311,21 +564,44 @@ function Write-WaterLog([string]$event, [string]$msg = '') {
         Add-Content -Path $waterLog -Value $line -Encoding UTF8
     } catch {}
 }
-$waterTimer.Add_Tick({
+function Hide-WaterFilter([switch]$RestartTimer) {
+    $waterFilterTimer.Stop()
+    if ('OracleWaterFilter' -as [type]) { [OracleWaterFilter]::Hide() }
+    $script:waterActive = $false
+    $miWaterDone.IsEnabled = $false
+    if ($RestartTimer) {
+        $waterTimer.Stop()
+        $waterTimer.Start()
+        Write-WaterLog 'confirmed' '已恢复显示，30 分钟后再次提醒'
+    }
+}
+function Show-WaterFilter([string]$source = 'manual') {
     try {
-        $msg = $waterMessages | Get-Random
-        Show-Bubble $msg
-        Write-WaterLog 'fire' $msg
-    } catch {}
+        Initialize-WaterFilter
+        [OracleWaterFilter]::Show()
+        $script:waterActive = $true
+        $miWaterDone.IsEnabled = $true
+        $waterTimer.Stop()
+        $waterFilterTimer.Start()
+        Write-WaterLog $source ("淡蓝滤镜开启，屏幕数：" + [OracleWaterFilter]::Handles.Length)
+    } catch {
+        Hide-WaterFilter
+        Write-WaterLog 'error' $_.Exception.Message
+        $waterTimer.Stop()
+        $waterTimer.Start()
+    }
+}
+$waterFilterTimer.Add_Tick({
+    if (-not $script:waterActive) { return }
+    try { [OracleWaterFilter]::Show() } catch {
+        Write-WaterLog 'error' $_.Exception.Message
+        Hide-WaterFilter -RestartTimer
+    }
 })
+$waterTimer.Add_Tick({ Show-WaterFilter 'fire' })
 $waterTimer.Start()
-
-# 右键菜单"立即提醒喝水"
-$miWater.Add_Click({
-    $msg = $waterMessages | Get-Random
-    Show-Bubble $msg
-    Write-WaterLog 'manual' $msg
-})
+$miWater.Add_Click({ Show-WaterFilter 'manual' })
+$miWaterDone.Add_Click({ Hide-WaterFilter -RestartTimer })
 
 # ---------- 外部任务完成通知 ----------
 # 任何程序往 $notifyDir 里写一个 *.txt，pet 就读出来弹气泡然后删掉。
@@ -374,7 +650,7 @@ if (Test-Path $cfgPath) {
 # 状态点颜色
 $colorOk      = '#FF4CAF50'  # 绿
 $colorSync    = '#FFFFC107'  # 黄
-$colorWarn    = '#FFFF9800'  # 橙：已同步但无对端在线
+$colorWarn    = '#FFFF9800'  # 橙：本机无待同步项，但未连接到同步设备
 $colorError   = '#FFE53935'  # 红
 $colorPaused  = '#FF03A9F4'  # 蓝：用户主动暂停
 $colorUnknown = '#FF9E9E9E'  # 灰
@@ -480,7 +756,7 @@ function Resolve-SyncKind($r) {
     } elseif ([int]$r.connected -gt 0) {
         return @{ kind = 'ok'; tip = "已同步 · 与 $($r.connected) 台设备相连" }
     } else {
-        return @{ kind = 'warn'; tip = '已同步 · 暂无对端在线' }
+        return @{ kind = 'warn'; tip = '本机无待同步项 · 未连接到同步设备' }
     }
 }
 
@@ -492,22 +768,27 @@ function Apply-SyncResult($raw) {
     $prev = $script:syncLastKind
     if ($prev -and $prev -ne $k) {
         switch ("$prev->$k") {
-            'ok->sync'      { Show-Bubble '🔄 开始同步…' }
-            'warn->sync'    { Show-Bubble '🔄 开始同步…' }
+            'ok->sync'      { Show-Bubble '🔄 开始同步…' -source 'sync' }
+            'warn->sync'    { Show-Bubble '🔄 开始同步…' -source 'sync' }
             'unknown->sync' { }
-            'sync->ok'      { Show-Bubble '✅ Oracle-Sync 同步完成' }
-            'sync->warn'    { Show-Bubble '✅ 已同步（暂无对端在线）' }
-            'ok->offline'   { Show-Bubble '⚠️ Syncthing 不在跑了' }
-            'sync->offline' { Show-Bubble '⚠️ Syncthing 不在跑了' }
-            'ok->error'     { Show-Bubble '⚠️ 同步出错，看下小圆点' }
-            'sync->error'   { Show-Bubble '⚠️ 同步出错，看下小圆点' }
-            'paused->ok'    { Show-Bubble '▶ 已恢复同步' }
-            'paused->sync'  { Show-Bubble '▶ 已恢复同步' }
-            'paused->warn'  { Show-Bubble '▶ 已恢复同步（暂无对端）' }
+            'sync->ok'      { Show-Bubble '✅ Oracle-Sync 同步完成' -source 'sync' }
+            'sync->warn'    { Show-Bubble '本机无待同步项 · 未连接到同步设备' -source 'sync' }
+            'ok->offline'   { Show-Bubble '⚠️ Syncthing 不在跑了' -source 'sync' }
+            'sync->offline' { Show-Bubble '⚠️ Syncthing 不在跑了' -source 'sync' }
+            'ok->error'     { Show-Bubble '⚠️ 同步出错，看下小圆点' -source 'sync' }
+            'sync->error'   { Show-Bubble '⚠️ 同步出错，看下小圆点' -source 'sync' }
+            'paused->ok'    { Show-Bubble '▶ 已恢复同步' -source 'sync' }
+            'paused->sync'  { Show-Bubble '▶ 已恢复同步' -source 'sync' }
+            'paused->warn'  { Show-Bubble '本机无待同步项 · 未连接到同步设备' -source 'sync' }
         }
     }
     $script:syncLastKind = $k
     $script:syncLast = $res
+    # 同步气泡持续展示当前状态；只改文字，不重新打开、不反复蹦跳。
+    # 外部任务通知使用独立来源，轮询不得覆盖用户尚未读完的通知。
+    if ($bubble.IsOpen -and $script:bubbleSource -eq 'sync') {
+        $bubbleText.Text = $res.tip
+    }
 }
 
 # 每个 Tick：先收割上一次后台轮询的结果（若已完成），再视情况启动下一次。
@@ -566,12 +847,13 @@ $win.Add_ContentRendered({
     try { Pump-SyncPoll } catch {}   # 立刻发起第一次轮询（后台线程，不阻塞）
     $syncTimer.Start()
     $topmostTimer.Start()
+    if ($WaterPreview) { Show-WaterFilter 'preview' }
 })
 
 # 右键菜单"查看同步状态"——显示最近一次后台轮询的缓存结果，并顺手触发一次刷新
 $miSync.Add_Click({
-    if ($script:syncLast -and $script:syncLast.tip) { Show-Bubble $script:syncLast.tip }
-    else { Show-Bubble 'Syncthing 状态：检测中…' }
+    if ($script:syncLast -and $script:syncLast.tip) { Show-Bubble $script:syncLast.tip -source 'sync' }
+    else { Show-Bubble 'Syncthing 状态：检测中…' -source 'sync' }
     try { Pump-SyncPoll } catch {}
 })
 
@@ -600,13 +882,26 @@ $miPause.Add_Click({
 
 # 打开菜单前刷新"暂停 / 恢复"标签
 $menu.Add_Opened({
-    if ($script:syncLastKind -eq 'paused') { $miPause.Header = '▶ 恢复同步' }
-    else                                    { $miPause.Header = '⏸ 暂停同步' }
+    if ($script:syncLastKind -eq 'paused') { $miPause.Header = '恢复同步'; $miPause.Icon = [string][char]0xE768 }
+    else                                    { $miPause.Header = '暂停同步'; $miPause.Icon = [string][char]0xE769 }
 })
 
 # 单实例：互斥锁
 $mutex = New-Object System.Threading.Mutex($false, 'Global\OracleSyncPet')
-if (-not $mutex.WaitOne(0)) { return }
+if (-not $mutex.WaitOne(0)) { Write-ExitLog 'mutex busy, exit'; return }
 
-[void]$win.ShowDialog()
-$mutex.ReleaseMutex()
+# 窗口关闭与未处理异常的记录（只记录，不改变异常是否终止进程的行为）
+$win.Add_Closed({ Write-ExitLog 'window closed' })
+$win.Dispatcher.add_UnhandledException({ param($s, $e) Write-ExitLog ('unhandled: ' + $e.Exception.ToString()) })
+
+try {
+    [void]$win.ShowDialog()
+} finally {
+    Write-ExitLog 'finally reached'
+    Hide-WaterFilter
+    foreach ($t in @($waterTimer, $waterFilterTimer, $timer, $notifyPoll, $syncTimer, $topmostTimer)) {
+        if ($t) { $t.Stop() }
+    }
+    $mutex.ReleaseMutex()
+    $mutex.Dispose()
+}
