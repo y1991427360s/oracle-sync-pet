@@ -22,57 +22,15 @@ function Write-ExitLog([string]$msg) {
     } catch {}
 }
 Write-ExitLog 'start'
+
+# 单实例：互斥锁。放在最前面，已有桌宠在跑时立刻退出，不再白白创建窗口和计时器。
+$mutex = New-Object System.Threading.Mutex($false, 'Global\OracleSyncPet')
+if (-not $mutex.WaitOne(0)) { Write-ExitLog 'mutex busy, exit'; return }
 [AppDomain]::CurrentDomain.add_ProcessExit({ Write-ExitLog 'process exit (normal)' })
 
-# ---------- 打开/激活同步文件夹 ----------
-# Win32 P/Invoke 类型只在"点击打开文件夹"时才用得到。Add-Type 底层会拉起 csc.exe
-# 编译，在冷启动时要花一两秒。把它推迟到第一次真正用到时再编译，能明显缩短开机后
-# 桌宠出现的时间。
-$script:win32Ready = $false
-function Initialize-Win32 {
-    if ($script:win32Ready) { return }
-    Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public static class Win32 {
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
-    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool f);
-    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-}
-"@
-    $script:win32Ready = $true
-}
-
-function Open-SyncFolder {
-    Initialize-Win32
-    $shell = New-Object -ComObject Shell.Application
-    $found = $null
-    foreach ($w in $shell.Windows()) {
-        try {
-            $u = $w.LocationURL
-            if (-not $u) { continue }
-            $p = [Uri]::new($u).LocalPath.TrimEnd('\')
-            if ($p -ieq $root) { $found = $w; break }
-        } catch {}
-    }
-    if ($found) {
-        $hwnd = [IntPtr]$found.HWND
-        if ([Win32]::IsIconic($hwnd)) { [void][Win32]::ShowWindow($hwnd, 9) }
-        $fg = [Win32]::GetForegroundWindow()
-        $pidOut = 0
-        $fgTid = [Win32]::GetWindowThreadProcessId($fg, [ref]$pidOut)
-        $curTid = [Win32]::GetCurrentThreadId()
-        [void][Win32]::AttachThreadInput($fgTid, $curTid, $true)
-        [void][Win32]::SetForegroundWindow($hwnd)
-        [void][Win32]::AttachThreadInput($fgTid, $curTid, $false)
-    } else {
-        Start-Process explorer.exe -ArgumentList "`"$root`""
-    }
-}
+# ---------- 打开/激活同步文件夹（与 open-sync-folder.ps1 共用） ----------
+. (Join-Path $PSScriptRoot 'oracle-sync-common.ps1')
+function Open-SyncFolder { Open-OracleSyncFolder $root }
 
 # ---------- 加载位置 ----------
 # 默认屏幕中央（实际位置在窗口创建后调整）
@@ -81,6 +39,7 @@ if (Test-Path $stateFile) {
     try { $pos = Get-Content $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
 }
 
+# region UI-XAML（preview-ui.ps1 会截取 region 到 endregion 之间的代码离屏渲染，改动时保持自包含）
 # ---------- 选择形象：优先 pet.png，否则 emoji ----------
 $transformBlock = @"
       <TransformGroup>
@@ -151,7 +110,7 @@ $xaml = @"
     </Ellipse>
     $bodyXaml
     <Ellipse x:Name="StatusDot" Width="16" Height="16" $dotXaml
-             Fill="#FF9E9E9E" Stroke="White" StrokeThickness="2.5"
+             Fill="#FF9E9E9E" Stroke="White" StrokeThickness="2.5" Cursor="Hand"
              ToolTip="Syncthing 状态：检测中…">
       <Ellipse.Effect>
         <DropShadowEffect BlurRadius="5" ShadowDepth="1" Opacity="0.4"/>
@@ -171,7 +130,7 @@ $xaml = @"
             <TextBlock x:Name="BubbleText" FontFamily="Microsoft YaHei UI, Segoe UI Emoji"
                        FontSize="13.5" Foreground="#FF3D3424" TextWrapping="Wrap" LineHeight="20"
                        Text="该喝水啦 💧"/>
-            <TextBlock Text="点击收起" FontFamily="Microsoft YaHei UI" FontSize="10.5"
+            <TextBlock x:Name="BubbleHint" Text="点击收起" FontFamily="Microsoft YaHei UI" FontSize="10.5"
                        Foreground="#FFB3A57E" HorizontalAlignment="Right" Margin="0,3,0,0"/>
           </StackPanel>
         </Border>
@@ -238,6 +197,19 @@ $menuXaml = @"
               <Trigger Property="IsEnabled" Value="False">
                 <Setter Property="Opacity" Value="0.4"/>
               </Trigger>
+              <!-- 顶部的状态信息行：只展示，不可点击 -->
+              <Trigger Property="Tag" Value="info">
+                <Setter TargetName="Bd" Property="Background" Value="#FFF7F8FA"/>
+                <Setter TargetName="Ico" Property="Foreground" Value="#FF9CA3AF"/>
+                <Setter Property="Foreground" Value="#FF6B7280"/>
+                <Setter Property="FontSize" Value="12"/>
+                <Setter Property="IsHitTestVisible" Value="False"/>
+                <Setter Property="Focusable" Value="False"/>
+              </Trigger>
+              <Trigger Property="Tag" Value="alert">
+                <Setter TargetName="Ico" Property="Foreground" Value="#FFE53935"/>
+                <Setter Property="Foreground" Value="#FFD32F2F"/>
+              </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
         </Setter.Value>
@@ -256,6 +228,8 @@ $menuXaml = @"
 </ContextMenu>
 "@
 
+# endregion UI-XAML
+
 $reader = New-Object System.Xml.XmlNodeReader ([xml]$xaml)
 $win = [Windows.Markup.XamlReader]::Load($reader)
 $win.Left = [double]$pos.Left
@@ -269,6 +243,7 @@ $petTrans    = $win.FindName('PetTrans')
 $bubble      = $win.FindName('Bubble')
 $bubbleText  = $win.FindName('BubbleText')
 $bubbleBorder= $win.FindName('BubbleBorder')
+$bubbleHint  = $win.FindName('BubbleHint')
 $statusDot   = $win.FindName('StatusDot')
 $bubbleRoot  = $win.FindName('BubbleRoot')
 $shadowScale = $win.FindName('ShadowScale')
@@ -278,26 +253,139 @@ $bubbleRoot.Add_SizeChanged({
     $bubble.HorizontalOffset = ($pet.ActualWidth - $bubbleRoot.ActualWidth) / 2
 })
 
+# ---------- 屏幕范围、位置校正与贴边 ----------
+# 屏幕坐标统一换算成 WPF 的 DIP（与 $win.Left/Top 同一套单位）。
+Add-Type -AssemblyName System.Windows.Forms
+$script:dock      = $null    # 'left' / 'right' / $null：贴在哪一侧屏幕边缘
+$script:dockShown = $false   # 贴边时当前是否完整探出
+if ($pos.PSObject.Properties['Dock'] -and $pos.Dock) { $script:dock = [string]$pos.Dock }
+
+function Save-PetState {
+    $left = $win.Left
+    if ($script:dock) { $left = Get-DockX $script:dock $false }   # 贴边时总是记录"藏起来"的位置
+    @{ Left = $left; Top = $win.Top; Dock = $script:dock } | ConvertTo-Json |
+        Set-Content -Path $stateFile -Encoding UTF8
+}
+
+function Get-PetScreens {
+    $m = [System.Windows.Media.Matrix]::Identity
+    $src = [System.Windows.PresentationSource]::FromVisual($win)
+    if ($src) { $m = $src.CompositionTarget.TransformToDevice }
+    foreach ($s in [System.Windows.Forms.Screen]::AllScreens) {
+        $b = $s.Bounds; $w = $s.WorkingArea
+        [pscustomobject]@{
+            Bounds = [System.Windows.Rect]::new($b.X / $m.M11, $b.Y / $m.M22, $b.Width / $m.M11, $b.Height / $m.M22)
+            Work   = [System.Windows.Rect]::new($w.X / $m.M11, $w.Y / $m.M22, $w.Width / $m.M11, $w.Height / $m.M22)
+        }
+    }
+}
+function Get-PetRect { [System.Windows.Rect]::new($win.Left, $win.Top, $win.ActualWidth, $win.ActualHeight) }
+
+# 与桌宠重叠面积最大的那块屏幕；完全不重叠时返回 $null
+function Get-PetScreen {
+    $r = Get-PetRect; $best = $null; $bestArea = 0
+    foreach ($s in Get-PetScreens) {
+        $i = [System.Windows.Rect]::Intersect($s.Bounds, $r)
+        if (-not $i.IsEmpty -and $i.Width * $i.Height -gt $bestArea) { $best = $s; $bestArea = $i.Width * $i.Height }
+    }
+    return $best
+}
+
+# 拔掉显示器、换分辨率后桌宠可能落在看不见的地方：可见部分太少就拉回主屏右下角。
+function Ensure-OnScreen {
+    if ($win.IsMouseCaptured -or $slideTimer.IsEnabled) { return }
+    $r = Get-PetRect
+    foreach ($s in Get-PetScreens) {
+        $i = [System.Windows.Rect]::Intersect($s.Bounds, $r)
+        if (-not $i.IsEmpty -and $i.Width -ge 24 -and $i.Height -ge 24) { return }
+    }
+    $wa = [System.Windows.SystemParameters]::WorkArea
+    $script:dock = $null
+    $win.Left = $wa.Right  - $win.ActualWidth  - 40
+    $win.Top  = $wa.Bottom - $win.ActualHeight - 40
+    Save-PetState
+}
+
+# 贴边位置：藏起来时只露出约 45%，探出时完整贴着屏幕边
+function Get-DockX([string]$side, [bool]$shown) {
+    $s = Get-PetScreen
+    $b = if ($s) { $s.Bounds } else { [System.Windows.Rect]::new(0, 0, [System.Windows.SystemParameters]::PrimaryScreenWidth, [System.Windows.SystemParameters]::PrimaryScreenHeight) }
+    $w = $win.ActualWidth
+    if ($side -eq 'left') { if ($shown) { return $b.Left } else { return $b.Left - $w * 0.55 } }
+    if ($shown) { return $b.Right - $w } else { return $b.Right - $w * 0.45 }
+}
+
+# 松手时离屏幕左/右外侧边缘足够近就贴边；两块屏幕相接的内侧边不算。
+function Get-SnapSide {
+    $s = Get-PetScreen
+    if (-not $s) { return $null }
+    $r = Get-PetRect; $cy = $r.Top + $r.Height / 2
+    $outside = {
+        param($x)
+        foreach ($o in Get-PetScreens) { if ($o.Bounds.Contains([System.Windows.Point]::new($x, $cy))) { return $false } }
+        return $true
+    }
+    if ($r.Left  -le $s.Bounds.Left  + 24 -and (& $outside ($s.Bounds.Left  - 4))) { return 'left' }
+    if ($r.Right -ge $s.Bounds.Right - 24 -and (& $outside ($s.Bounds.Right + 4))) { return 'right' }
+    return $null
+}
+
+# 水平滑动的小补间动画（Window.Left 不适合直接挂 WPF 动画，拖动时会被动画锁住）
+$script:slideTarget = 0.0
+$slideTimer = New-Object System.Windows.Threading.DispatcherTimer
+$slideTimer.Interval = [TimeSpan]::FromMilliseconds(15)
+$slideTimer.Add_Tick({
+    $d = $script:slideTarget - $win.Left
+    if ([Math]::Abs($d) -lt 1) { $win.Left = $script:slideTarget; $slideTimer.Stop(); return }
+    $win.Left = $win.Left + $d * 0.3
+})
+function Slide-To([double]$x) { $script:slideTarget = $x; $slideTimer.Start() }
+
+function Show-Docked {
+    if (-not $script:dock) { return }
+    $dockHideTimer.Stop()
+    $script:dockShown = $true
+    Slide-To (Get-DockX $script:dock $true)
+}
+function Hide-Docked {
+    if (-not $script:dock) { return }
+    if ($win.IsMouseOver -or $win.IsMouseCaptured -or $bubble.IsOpen -or $menu.IsOpen) { return }
+    $script:dockShown = $false
+    Slide-To (Get-DockX $script:dock $false)
+}
+# 鼠标离开 1.2 秒后再缩回去，避免擦边划过时来回抖动
+$dockHideTimer = New-Object System.Windows.Threading.DispatcherTimer
+$dockHideTimer.Interval = [TimeSpan]::FromMilliseconds(1200)
+$dockHideTimer.Add_Tick({ $dockHideTimer.Stop(); Hide-Docked })
+function Request-HideDocked { if ($script:dock) { $dockHideTimer.Stop(); $dockHideTimer.Start() } }
+$win.Add_MouseEnter({ Show-Docked })
+$win.Add_MouseLeave({ Request-HideDocked })
+
 # ---------- 拖动 vs 点击 ----------
 $script:startMouse = $null
 $script:startLeft  = 0.0
 $script:startTop   = 0.0
 $script:moved      = $false
+$script:downOnDot  = $false
 
 $win.Add_MouseLeftButtonDown({
     $script:startMouse = $win.PointToScreen($_.GetPosition($win))
     $script:startLeft  = $win.Left
     $script:startTop   = $win.Top
     $script:moved      = $false
+    $script:downOnDot  = ($_.OriginalSource -eq $statusDot)
+    $slideTimer.Stop()
     [void]$win.CaptureMouse()
 })
 
 $win.Add_MouseMove({
     if ($win.IsMouseCaptured) {
+        # PointToScreen 返回物理像素，换算成 DIP 再加到 Left/Top 上
         $cur = $win.PointToScreen($_.GetPosition($win))
-        $dx  = $cur.X - $script:startMouse.X
-        $dy  = $cur.Y - $script:startMouse.Y
-        if ([Math]::Abs($dx) -gt 4 -or [Math]::Abs($dy) -gt 4) { $script:moved = $true }
+        $m = [System.Windows.PresentationSource]::FromVisual($win).CompositionTarget.TransformToDevice
+        $dx  = ($cur.X - $script:startMouse.X) / $m.M11
+        $dy  = ($cur.Y - $script:startMouse.Y) / $m.M22
+        if ([Math]::Abs($dx) -gt 4 -or [Math]::Abs($dy) -gt 4) { $script:moved = $true; $script:dock = $null }
         if ($script:moved) {
             $win.Left = $script:startLeft + $dx
             $win.Top  = $script:startTop  + $dy
@@ -308,7 +396,17 @@ $win.Add_MouseMove({
 $win.Add_MouseLeftButtonUp({
     if ($win.IsMouseCaptured) { $win.ReleaseMouseCapture() }
     if ($script:moved) {
-        @{ Left = $win.Left; Top = $win.Top } | ConvertTo-Json | Set-Content -Path $stateFile -Encoding UTF8
+        $side = Get-SnapSide
+        if ($side) {
+            $script:dock = $side
+            $script:dockShown = $true
+            Slide-To (Get-DockX $side $true)
+            Request-HideDocked
+        }
+        Save-PetState
+    } elseif ($script:downOnDot) {
+        # 点状态小圆点：打开 Syncthing 网页管理界面
+        Start-Process 'http://127.0.0.1:8384/'
     } else {
         # 按一下：缩放动画 + 打开文件夹
         $pop = New-Object System.Windows.Media.Animation.DoubleAnimation 0.75, 1.0, ([TimeSpan]::FromMilliseconds(220))
@@ -332,6 +430,7 @@ $pet.Add_MouseLeave({
 })
 
 # ---------- 右键菜单 ----------
+# region UI-MENU（preview-ui.ps1 同样会截取这一段）
 $menu = [Windows.Markup.XamlReader]::Parse($menuXaml)
 function New-MenuItem([string]$header, [int]$glyph) {
     $mi = New-Object System.Windows.Controls.MenuItem
@@ -339,13 +438,18 @@ function New-MenuItem([string]$header, [int]$glyph) {
     $mi.Icon   = [string][char]$glyph
     return $mi
 }
+$miInfo = New-MenuItem 'Syncthing 状态：检测中…' 0xE946
+$miInfo.Tag = 'info'
 $miOpen = New-MenuItem '打开 Oracle-Sync' 0xE838
 $miOpen.Add_Click({ Open-SyncFolder })
+$miWeb = New-MenuItem '打开 Syncthing 管理页' 0xE774
+$miWeb.Add_Click({ Start-Process 'http://127.0.0.1:8384/' })
 $miReset = New-MenuItem '回到屏幕中央' 0xE81D
 $miReset.Add_Click({
+    $script:dock = $null
     $win.Left = ([System.Windows.SystemParameters]::PrimaryScreenWidth  - $win.ActualWidth)  / 2
     $win.Top  = ([System.Windows.SystemParameters]::PrimaryScreenHeight - $win.ActualHeight) / 2
-    @{ Left = $win.Left; Top = $win.Top } | ConvertTo-Json | Set-Content -Path $stateFile -Encoding UTF8
+    Save-PetState
 })
 $miExit = New-MenuItem '退出桌宠' 0xE7E8
 $miExit.Tag = 'danger'
@@ -353,18 +457,24 @@ $miExit.Add_Click({ $win.Close() })
 $miWater = New-MenuItem '立即提醒喝水' 0xE916
 $miSync  = New-MenuItem '查看同步状态' 0xE895
 $miPause = New-MenuItem '暂停同步' 0xE769
+$miConflict = New-MenuItem '同步冲突文件' 0xE7BA
+$miConflict.Tag = 'alert'
+$miConflict.Visibility = 'Collapsed'
 $miWaterDone = New-MenuItem '已喝水，恢复显示' 0xE73E
 $miWaterDone.IsEnabled = $false
-[void]$menu.Items.Add($miOpen)
-[void]$menu.Items.Add((New-Object System.Windows.Controls.Separator))
-[void]$menu.Items.Add($miSync)
-[void]$menu.Items.Add($miPause)
-[void]$menu.Items.Add((New-Object System.Windows.Controls.Separator))
-[void]$menu.Items.Add($miWater)
-[void]$menu.Items.Add($miWaterDone)
-[void]$menu.Items.Add((New-Object System.Windows.Controls.Separator))
-[void]$menu.Items.Add($miReset)
-[void]$menu.Items.Add($miExit)
+$miSnooze = New-MenuItem '5 分钟后再提醒' 0xE823
+$miSnooze.IsEnabled = $false
+$miDnd = New-MenuItem '勿扰 1 小时' 0xE708
+foreach ($it in @(
+    $miInfo, 'sep',
+    $miOpen, $miWeb, 'sep',
+    $miSync, $miPause, $miConflict, 'sep',
+    $miWater, $miWaterDone, $miSnooze, $miDnd, 'sep',
+    $miReset, $miExit)) {
+    if ($it -is [string]) { [void]$menu.Items.Add((New-Object System.Windows.Controls.Separator)) }
+    else { [void]$menu.Items.Add($it) }
+}
+# endregion UI-MENU
 $win.ContextMenu = $menu
 
 # ---------- 闲置时的呼吸动画 ----------
@@ -440,26 +550,65 @@ $timer.Add_Tick({
 $timer.Start()
 
 # ---------- 通用通知气泡 ----------
+# source 决定气泡的"分量"：
+#   notification / conflict —— 需要用户看到的消息：不会被别的消息顶掉，排队依次显示；勿扰期间攒着，结束后再弹
+#   sync                    —— 同步状态播报：只反映当前状态，被挡住或勿扰时直接丢弃（状态点仍会更新）
+#   manual                  —— 用户刚在菜单里点的操作反馈：总是立即显示，原来未读的消息放回队首
 $script:bubbleSource = $null
-function Show-Bubble([string]$text, [int]$seconds = 0, [string]$source = 'notification') {
+$script:bubbleQueue  = New-Object System.Collections.Generic.List[object]
+$script:dndUntil     = [DateTime]::MinValue
+function Test-Dnd { return [DateTime]::Now -lt $script:dndUntil }
+function Test-StickySource([string]$s) { return ($s -eq 'notification' -or $s -eq 'conflict') }
+
+function Update-BubbleHint {
+    $n = $script:bubbleQueue.Count
+    $bubbleHint.Text = if ($n -gt 0) { "点击查看下一条（还有 $n 条）" } else { '点击收起' }
+}
+function Open-BubbleNow([string]$text, [string]$source) {
     $script:bubbleSource = $source
     $bubbleText.Text = $text
+    Update-BubbleHint
     $bubble.IsOpen = $true
+    Show-Docked
     Hop  # 蹦一下吸引注意
+}
+function Show-Bubble([string]$text, [int]$seconds = 0, [string]$source = 'notification') {
     # seconds 参数仅保留兼容旧调用；所有气泡都必须点击后才收起。
+    $item = [pscustomobject]@{ Text = $text; Source = $source }
+    if ($source -ne 'manual' -and (Test-Dnd)) {
+        if (Test-StickySource $source) { $script:bubbleQueue.Add($item) }
+        return
+    }
+    if ($bubble.IsOpen -and (Test-StickySource $script:bubbleSource)) {
+        if ($source -eq 'manual') {
+            $script:bubbleQueue.Insert(0, [pscustomobject]@{ Text = $bubbleText.Text; Source = $script:bubbleSource })
+        } elseif (Test-StickySource $source) {
+            # 连续的同一条消息只留一份
+            $last = if ($script:bubbleQueue.Count) { $script:bubbleQueue[$script:bubbleQueue.Count - 1].Text } else { $bubbleText.Text }
+            if ($last -ne $text) { $script:bubbleQueue.Add($item); Update-BubbleHint; Hop }
+            return
+        } else { return }
+    }
+    Open-BubbleNow $text $source
+}
+function Show-NextBubble {
+    if ($script:bubbleQueue.Count -eq 0) { $bubble.IsOpen = $false; return }
+    $next = $script:bubbleQueue[0]
+    $script:bubbleQueue.RemoveAt(0)
+    Open-BubbleNow $next.Text $next.Source
 }
 
-# 点气泡：立刻收起
+# 点气泡：有排队消息就显示下一条，否则收起
 $bubbleBorder.Add_MouseLeftButtonDown({
-    $bubble.IsOpen = $false
+    Show-NextBubble
     $_.Handled = $true
 })
+$bubble.Add_Closed({ Request-HideDocked })
 
 # ---------- 喝水滤镜：原生分层窗口，按物理像素覆盖每块显示器 ----------
 # 不修改系统颜色设置；窗口透明且不激活，保留鼠标穿透。
-function Initialize-WaterFilter {
-    if ('OracleWaterFilter' -as [type]) { return }
-    Add-Type @"
+# C# 源码单独放在变量里，启动后由后台 runspace 预编译，第一次提醒时不再卡顿。
+$waterFilterSource = @"
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -550,11 +699,20 @@ public static class OracleWaterFilter {
     }
 }
 "@
+function Initialize-WaterFilter {
+    if ('OracleWaterFilter' -as [type]) { return }
+    try { Add-Type $waterFilterSource } catch { if (-not ('OracleWaterFilter' -as [type])) { throw } }
 }
 
-$script:waterActive = $false
+# 计时规则：只累计"人在电脑前"的时间。
+#   - 2 分钟以上没有键鼠输入：暂停累计；10 分钟以上：视为已离开休息，计时清零
+#   - 到点时如果处于勿扰、锁屏、全屏或演示模式，先不弹，等情况解除后的下一次检查再弹
+$script:waterActive   = $false
+$script:waterElapsed  = 0
+$waterIntervalSec     = 1800
+$waterTickSec         = 30
 $waterTimer = New-Object System.Windows.Threading.DispatcherTimer
-$waterTimer.Interval = [TimeSpan]::FromMinutes(30)
+$waterTimer.Interval = [TimeSpan]::FromSeconds($waterTickSec)
 $waterFilterTimer = New-Object System.Windows.Threading.DispatcherTimer
 $waterFilterTimer.Interval = [TimeSpan]::FromSeconds(2)
 $waterLog = Join-Path $stateDir 'water.log'
@@ -569,9 +727,9 @@ function Hide-WaterFilter([switch]$RestartTimer) {
     if ('OracleWaterFilter' -as [type]) { [OracleWaterFilter]::Hide() }
     $script:waterActive = $false
     $miWaterDone.IsEnabled = $false
+    $miSnooze.IsEnabled = $false
     if ($RestartTimer) {
-        $waterTimer.Stop()
-        $waterTimer.Start()
+        $script:waterElapsed = 0
         Write-WaterLog 'confirmed' '已恢复显示，30 分钟后再次提醒'
     }
 }
@@ -581,14 +739,13 @@ function Show-WaterFilter([string]$source = 'manual') {
         [OracleWaterFilter]::Show()
         $script:waterActive = $true
         $miWaterDone.IsEnabled = $true
-        $waterTimer.Stop()
+        $miSnooze.IsEnabled = $true
         $waterFilterTimer.Start()
         Write-WaterLog $source ("淡蓝滤镜开启，屏幕数：" + [OracleWaterFilter]::Handles.Length)
     } catch {
         Hide-WaterFilter
         Write-WaterLog 'error' $_.Exception.Message
-        $waterTimer.Stop()
-        $waterTimer.Start()
+        $script:waterElapsed = 0
     }
 }
 $waterFilterTimer.Add_Tick({
@@ -598,10 +755,56 @@ $waterFilterTimer.Add_Tick({
         Hide-WaterFilter -RestartTimer
     }
 })
-$waterTimer.Add_Tick({ Show-WaterFilter 'fire' })
+
+# ---------- 勿扰模式 ----------
+function Start-Dnd {
+    $script:dndUntil = [DateTime]::Now.AddHours(1)
+    $pet.Opacity = 0.55
+    if ($script:waterActive) { Hide-WaterFilter; $script:waterElapsed = $waterIntervalSec }   # 勿扰结束后再提醒
+    if ($bubble.IsOpen -and -not (Test-StickySource $script:bubbleSource)) { $bubble.IsOpen = $false }
+    Write-WaterLog 'dnd' '开启勿扰 1 小时'
+}
+function Stop-Dnd {
+    $script:dndUntil = [DateTime]::MinValue
+    $pet.Opacity = 1.0
+    Write-WaterLog 'dnd' '结束勿扰'
+    if ($script:bubbleQueue.Count -gt 0 -and -not $bubble.IsOpen) { Show-NextBubble }
+}
+
+$waterTimer.Add_Tick({
+    try {
+        if ($script:dndUntil -ne [DateTime]::MinValue -and -not (Test-Dnd)) { Stop-Dnd }
+        if ($script:waterActive) { return }
+        $idle = 0.0; $ns = 5
+        if ('OracleSyncWin32' -as [type]) {
+            $idle = [OracleSyncWin32]::IdleSeconds()
+            $ns   = [OracleSyncWin32]::NotificationState()
+        }
+        if ($idle -ge 600) {
+            if ($script:waterElapsed -gt 0) { Write-WaterLog 'away' ('离开 {0:N0} 分钟，计时清零' -f ($idle / 60)) }
+            $script:waterElapsed = 0
+            return
+        }
+        if ($idle -ge 120) { return }
+        if ($script:waterElapsed -lt $waterIntervalSec) { $script:waterElapsed += $waterTickSec }
+        if ($script:waterElapsed -lt $waterIntervalSec) { return }
+        if (Test-Dnd) { return }
+        if (@(1, 2, 3, 4, 7) -contains $ns) { return }   # 锁屏 / 全屏 / 演示模式：推迟
+        Show-WaterFilter 'fire'
+    } catch { Write-WaterLog 'error' $_.Exception.Message }
+})
 $waterTimer.Start()
 $miWater.Add_Click({ Show-WaterFilter 'manual' })
 $miWaterDone.Add_Click({ Hide-WaterFilter -RestartTimer })
+$miSnooze.Add_Click({
+    Hide-WaterFilter
+    $script:waterElapsed = $waterIntervalSec - 300
+    Write-WaterLog 'snooze' '5 分钟后再提醒'
+})
+$miDnd.Add_Click({
+    if (Test-Dnd) { Stop-Dnd; Show-Bubble '已结束勿扰' -source 'manual' }
+    else { Start-Dnd; Show-Bubble '🌙 勿扰 1 小时：暂停气泡和喝水提醒' -source 'manual' }
+})
 
 # ---------- 外部任务完成通知 ----------
 # 任何程序往 $notifyDir 里写一个 *.txt，pet 就读出来弹气泡然后删掉。
@@ -629,6 +832,7 @@ $notifyPoll.Start()
 $script:syncApiKey   = $null
 $script:syncFolderId = $null
 $script:syncLastKind = $null   # 上次稳定状态，用于"状态变化时弹气泡"
+$script:syncLastFile = $null   # 最近同步的文件 @{ at; name }，来自 /rest/stats/folder
 
 $cfgPath = Join-Path $env:LOCALAPPDATA 'Syncthing\config.xml'
 if (Test-Path $cfgPath) {
@@ -680,16 +884,6 @@ function Set-StatusDot([string]$kind, [string]$tooltip) {
     }
 }
 
-function Test-SyncthingPort {
-    try {
-        $c = New-Object System.Net.Sockets.TcpClient
-        $ar = $c.BeginConnect('127.0.0.1', 8384, $null, $null)
-        $ok = $ar.AsyncWaitHandle.WaitOne(300)
-        if ($ok -and $c.Connected) { $c.EndConnect($ar); $c.Close(); return $true }
-        $c.Close(); return $false
-    } catch { return $false }
-}
-
 function Get-HumanBytes([long]$n) {
     if ($n -lt 1KB)  { return "$n B" }
     if ($n -lt 1MB)  { return ('{0:N1} KB' -f ($n / 1KB)) }
@@ -702,6 +896,9 @@ function Get-HumanBytes([long]$n) {
 # 三个请求最坏要等 6 秒，期间桌宠窗口卡住出不来——这就是"开机扫描很慢"的根因。
 # 现在改成后台线程拉数据，主线程只在 Tick 时收割结果刷新小圆点，彻底消除卡顿。
 $script:syncLast   = @{ kind = 'unknown'; tip = '检测中…' }
+# 所有后台任务共用一个小线程池：不再每次轮询都新建一个 runspace（创建 runspace 本身就要几十毫秒和不少内存）
+$bgPool = [RunspaceFactory]::CreateRunspacePool(1, 3)
+$bgPool.Open()
 $script:pollPS     = $null
 $script:pollHandle = $null
 
@@ -728,6 +925,13 @@ $pollScript = {
         $st = Invoke-RestMethod -Uri "http://127.0.0.1:8384/rest/db/status?folder=$folderId" -Headers $headers -TimeoutSec 2
         $cn = Invoke-RestMethod -Uri 'http://127.0.0.1:8384/rest/system/connections' -Headers $headers -TimeoutSec 2
     } catch { return @{ kind = 'error'; tip = ('Syncthing 无响应：' + $_.Exception.Message) } }
+    # 最近一次收到/改动的文件（可选信息，取不到不影响状态判断）
+    $lastAt = $null; $lastName = $null
+    try {
+        $fs = Invoke-RestMethod -Uri 'http://127.0.0.1:8384/rest/stats/folder' -Headers $headers -TimeoutSec 2
+        $lf = $fs.$folderId.lastFile
+        if ($lf -and $lf.at) { $lastAt = [string]$lf.at; $lastName = [string]$lf.filename }
+    } catch {}
     $connected = 0
     if ($cn.connections) {
         foreach ($p in $cn.connections.PSObject.Properties) { if ($p.Value.connected) { $connected++ } }
@@ -738,6 +942,8 @@ $pollScript = {
         needFiles = [int]($st.needFiles + $st.needDirectories + $st.needSymlinks + $st.needDeletes)
         connected = $connected
         error     = [string]$st.error
+        lastAt    = $lastAt
+        lastName  = $lastName
     }
 }
 
@@ -761,10 +967,33 @@ function Resolve-SyncKind($r) {
 }
 
 # 拿到一次轮询结果后刷新小圆点，并在状态变化时弹气泡（运行在 UI 线程）。
+function Format-SyncTime([string]$iso) {
+    try { $d = [DateTime]::Parse($iso).ToLocalTime() } catch { return $null }
+    if ($d.Year -lt 2000) { return $null }
+    $today = [DateTime]::Today
+    if ($d.Date -eq $today)             { return '今天 ' + $d.ToString('HH:mm') }
+    if ($d.Date -eq $today.AddDays(-1)) { return '昨天 ' + $d.ToString('HH:mm') }
+    return $d.ToString('MM-dd HH:mm')
+}
+# "最近同步：今天 14:32 · 文件名"，文件名过长时截断
+function Get-LastSyncLine {
+    $l = $script:syncLastFile
+    if (-not $l) { return $null }
+    $when = Format-SyncTime $l.at
+    if (-not $when) { return $null }
+    $name = [IO.Path]::GetFileName(([string]$l.name).TrimEnd('/', '\'))
+    if ($name.Length -gt 22) { $name = $name.Substring(0, 21) + '…' }
+    if ($name) { return "最近同步：$when · $name" } else { return "最近同步：$when" }
+}
+
 function Apply-SyncResult($raw) {
+    if ($raw.ContainsKey('lastAt') -and $raw.lastAt) { $script:syncLastFile = @{ at = $raw.lastAt; name = $raw.lastName } }
     $res = Resolve-SyncKind $raw
     $k = $res.kind
-    Set-StatusDot $k $res.tip
+    $dotTip = $res.tip
+    $lastLine = Get-LastSyncLine
+    if ($lastLine) { $dotTip += "`n" + $lastLine }
+    Set-StatusDot $k ($dotTip + "`n点击打开 Syncthing 管理页")
     $prev = $script:syncLastKind
     if ($prev -and $prev -ne $k) {
         switch ("$prev->$k") {
@@ -808,6 +1037,7 @@ function Pump-SyncPoll {
     if (-not $script:pollHandle) {
         try {
             $script:pollPS = [PowerShell]::Create()
+            $script:pollPS.RunspacePool = $bgPool
             [void]$script:pollPS.AddScript($pollScript).AddArgument($script:syncApiKey).AddArgument($script:syncFolderId)
             $script:pollHandle = $script:pollPS.BeginInvoke()
         } catch { $script:pollPS = $null; $script:pollHandle = $null }
@@ -838,57 +1068,197 @@ function Set-AlwaysOnTop {
 }
 $topmostTimer = New-Object System.Windows.Threading.DispatcherTimer
 $topmostTimer.Interval = [TimeSpan]::FromSeconds(2)
-$topmostTimer.Add_Tick({ try { Set-AlwaysOnTop } catch {} })
+$topmostTimer.Add_Tick({
+    try { Set-AlwaysOnTop } catch {}
+    try { Ensure-OnScreen } catch {}   # 显示器变化后把跑出屏幕的桌宠拉回来
+})
 # 桌宠一旦失去前台（多半是别的窗口冒到前面），立刻顶回去，恢复更跟手。
 $win.Add_Deactivated({ try { Set-AlwaysOnTop } catch {} })
 
+# ---------- 通用后台任务 ----------
+# Start-BgJob 把脚本丢进线程池执行，$bgTimer 在 UI 线程上收割结果并调用回调。
+# 后台脚本绝不能碰 WPF 对象，只返回数据；回调运行在 UI 线程，可以随意刷新界面。
+$script:bgJobs = New-Object System.Collections.Generic.List[object]
+function Start-BgJob([scriptblock]$job, [object[]]$arguments = @(), [scriptblock]$onDone = $null) {
+    $ps = [PowerShell]::Create()
+    $ps.RunspacePool = $bgPool
+    [void]$ps.AddScript($job.ToString())
+    foreach ($a in $arguments) { [void]$ps.AddArgument($a) }
+    $script:bgJobs.Add([pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke(); Done = $onDone })
+    if (-not $bgTimer.IsEnabled) { $bgTimer.Start() }
+}
+$bgTimer = New-Object System.Windows.Threading.DispatcherTimer
+$bgTimer.Interval = [TimeSpan]::FromMilliseconds(200)
+$bgTimer.Add_Tick({
+    for ($i = $script:bgJobs.Count - 1; $i -ge 0; $i--) {
+        $j = $script:bgJobs[$i]
+        if (-not $j.Handle.IsCompleted) { continue }
+        $script:bgJobs.RemoveAt($i)
+        $out = $null; $err = $null
+        try { $out = $j.PS.EndInvoke($j.Handle) | Select-Object -Last 1 } catch { $err = $_.Exception.Message }
+        try { $j.PS.Dispose() } catch {}
+        if ($j.Done) { try { & $j.Done $out $err } catch {} }
+    }
+    if ($script:bgJobs.Count -eq 0) { $bgTimer.Stop() }
+})
+
+# ---------- 启动后预热：后台编译 C# 类型 + 清理过大的日志 ----------
+# Add-Type 生成的类型对整个进程可见，所以在后台 runspace 里编译，UI 线程直接就能用。
+$commonLib = Join-Path $PSScriptRoot 'oracle-sync-common.ps1'
+function Start-Warmup {
+    $logs = @($exitLog, $waterLog, (Join-Path $stateDir 'codex-notify.log'), (Join-Path $stateDir 'notify-pet.log'))
+    Start-BgJob {
+        param($lib, $waterSrc, $logs)
+        . $lib
+        try { Initialize-OracleWin32 } catch {}
+        try { if (-not ('OracleWaterFilter' -as [type])) { Add-Type $waterSrc } } catch {}
+        foreach ($l in $logs) { Limit-OracleLog $l }
+    } @($commonLib, $waterFilterSource, $logs)
+}
+
+# ---------- 同步冲突文件检测 ----------
+# Syncthing 遇到两边同时修改时会生成 "文件名.sync-conflict-日期-时间-设备.扩展名" 副本，很容易被忽略。
+# 每 10 分钟在后台扫一遍同步目录（跳过 .stversions 等目录），发现新的冲突就弹气泡提醒。
+$script:conflicts        = @()
+$script:conflictKnown    = @{}
+$script:conflictScanning = $false
+$conflictScript = {
+    param($root)
+    $found = New-Object System.Collections.Generic.List[string]
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push($root)
+    while ($stack.Count -gt 0) {
+        $dir = $stack.Pop()
+        try {
+            foreach ($d in [IO.Directory]::EnumerateDirectories($dir)) {
+                $n = [IO.Path]::GetFileName($d)
+                if ($n -eq '.stversions' -or $n -eq '.stfolder' -or $n -eq '.git' -or $n -eq 'node_modules') { continue }
+                $stack.Push($d)
+            }
+            foreach ($f in [IO.Directory]::EnumerateFiles($dir, '*.sync-conflict-*')) { $found.Add($f) }
+        } catch {}
+    }
+    return ($found -join "`n")
+}
+function Start-ConflictScan {
+    if ($script:conflictScanning) { return }
+    $script:conflictScanning = $true
+    Start-BgJob $conflictScript @($root) {
+        param($out, $err)
+        $script:conflictScanning = $false
+        if ($err) { return }
+        $list = @(([string]$out) -split "`n" | Where-Object { $_ })
+        $new  = @($list | Where-Object { -not $script:conflictKnown.ContainsKey($_) })
+        $script:conflicts = $list
+        $script:conflictKnown = @{}
+        foreach ($f in $list) { $script:conflictKnown[$f] = $true }
+        if ($list.Count -gt 0) {
+            $miConflict.Header = "同步冲突文件（$($list.Count)）"
+            $miConflict.Visibility = 'Visible'
+        } else { $miConflict.Visibility = 'Collapsed' }
+        if ($new.Count -gt 0) {
+            $names = ($new | Select-Object -First 3 | ForEach-Object { [IO.Path]::GetFileName($_) }) -join "`n"
+            $more  = if ($new.Count -gt 3) { "`n…等 $($new.Count) 个" } else { '' }
+            Show-Bubble ("⚠️ 发现 $($new.Count) 个同步冲突文件：`n" + $names + $more + "`n右键 → 同步冲突文件 查看") -source 'conflict'
+        }
+    }
+}
+$conflictTimer = New-Object System.Windows.Threading.DispatcherTimer
+$conflictTimer.Interval = [TimeSpan]::FromMinutes(10)
+$conflictTimer.Add_Tick({ try { Start-ConflictScan } catch {} })
+# 开机后等 1 分钟再扫第一次，避开 Syncthing 自己的启动扫描
+$conflictFirst = New-Object System.Windows.Threading.DispatcherTimer
+$conflictFirst.Interval = [TimeSpan]::FromSeconds(60)
+$conflictFirst.Add_Tick({ $conflictFirst.Stop(); try { Start-ConflictScan } catch {}; $conflictTimer.Start() })
+
+$miConflict.Add_Click({
+    $list = @($script:conflicts | Where-Object { Test-Path -LiteralPath $_ })
+    if ($list.Count -eq 0) {
+        $miConflict.Visibility = 'Collapsed'
+        Show-Bubble '冲突文件已经处理完了 👍' -source 'manual'
+        return
+    }
+    # 在资源管理器中定位第一个，并列出前几个的相对路径
+    Start-Process explorer.exe -ArgumentList ('/select,"{0}"' -f $list[0])
+    $rel  = ($list | Select-Object -First 5 | ForEach-Object { $_.Substring($root.Length).TrimStart('\') }) -join "`n"
+    $more = if ($list.Count -gt 5) { "`n…共 $($list.Count) 个" } else { '' }
+    Show-Bubble ("同步冲突文件（已定位第一个）：`n" + $rel + $more + "`n对比后保留需要的版本，删掉冲突副本即可") -source 'manual'
+    Start-ConflictScan
+})
+
 # 窗口内容渲染完成后再启动轮询：先让桌宠瞬间出现，不被网络请求拖住开机。
 $win.Add_ContentRendered({
+    try { Ensure-OnScreen } catch {}
+    if ($script:dock) { try { $win.Left = Get-DockX $script:dock $false } catch {} }
     try { Pump-SyncPoll } catch {}   # 立刻发起第一次轮询（后台线程，不阻塞）
     $syncTimer.Start()
     $topmostTimer.Start()
+    $conflictFirst.Start()
+    try { Start-Warmup } catch {}
     if ($WaterPreview) { Show-WaterFilter 'preview' }
 })
 
-# 右键菜单"查看同步状态"——显示最近一次后台轮询的缓存结果，并顺手触发一次刷新
+# 右键菜单"查看同步状态"——显示最近一次后台轮询的缓存结果，并顺手触发一次刷新。
+# 以 manual 身份弹出（不会被未读通知挡住），之后改记为 sync，让轮询继续刷新文字。
 $miSync.Add_Click({
-    if ($script:syncLast -and $script:syncLast.tip) { Show-Bubble $script:syncLast.tip -source 'sync' }
-    else { Show-Bubble 'Syncthing 状态：检测中…' -source 'sync' }
+    $tip = if ($script:syncLast -and $script:syncLast.tip) { $script:syncLast.tip } else { 'Syncthing 状态：检测中…' }
+    Show-Bubble $tip -source 'manual'
+    $script:bubbleSource = 'sync'
     try { Pump-SyncPoll } catch {}
 })
 
-# 右键菜单"暂停 / 恢复同步"——根据当前是否暂停切换
+# 右键菜单"暂停 / 恢复同步"——网络请求放到后台执行，界面不会卡住
+$script:pauseBusy = $false
 $miPause.Add_Click({
     if (-not $script:syncApiKey -or -not $script:syncFolderId) {
-        Show-Bubble '找不到 Syncthing 配置，无法切换'
+        Show-Bubble '找不到 Syncthing 配置，无法切换' -source 'manual'
         return
     }
-    if (-not (Test-SyncthingPort)) {
-        Show-Bubble 'Syncthing 没在跑，先把它启动起来'
-        return
-    }
-    $headers = @{ 'X-API-Key' = $script:syncApiKey; 'Content-Type' = 'application/json' }
-    try {
-        $fcfg = Invoke-RestMethod -Uri "http://127.0.0.1:8384/rest/config/folders/$($script:syncFolderId)" -Headers $headers -TimeoutSec 2
-        $newPaused = -not [bool]$fcfg.paused
-        $body = (@{ paused = $newPaused } | ConvertTo-Json -Compress)
-        Invoke-RestMethod -Method Patch -Uri "http://127.0.0.1:8384/rest/config/folders/$($script:syncFolderId)" -Headers $headers -Body $body -TimeoutSec 3 | Out-Null
-        if ($newPaused) { Show-Bubble '⏸ 已暂停 Oracle-Sync 同步' } else { Show-Bubble '▶ 已恢复 Oracle-Sync 同步' }
+    if ($script:pauseBusy) { return }
+    $script:pauseBusy = $true
+    Start-BgJob {
+        param($apiKey, $folderId)
+        $c = New-Object System.Net.Sockets.TcpClient
+        try {
+            $ar = $c.BeginConnect('127.0.0.1', 8384, $null, $null)
+            if (-not ($ar.AsyncWaitHandle.WaitOne(300) -and $c.Connected)) { return @{ ok = $false; offline = $true } }
+        } catch { return @{ ok = $false; offline = $true } } finally { $c.Close() }
+        $headers = @{ 'X-API-Key' = $apiKey; 'Content-Type' = 'application/json' }
+        try {
+            $uri  = "http://127.0.0.1:8384/rest/config/folders/$folderId"
+            $fcfg = Invoke-RestMethod -Uri $uri -Headers $headers -TimeoutSec 3
+            $newPaused = -not [bool]$fcfg.paused
+            $body = (@{ paused = $newPaused } | ConvertTo-Json -Compress)
+            Invoke-RestMethod -Method Patch -Uri $uri -Headers $headers -Body $body -TimeoutSec 3 | Out-Null
+            return @{ ok = $true; paused = $newPaused }
+        } catch { return @{ ok = $false; error = $_.Exception.Message } }
+    } @($script:syncApiKey, $script:syncFolderId) {
+        param($r, $err)
+        $script:pauseBusy = $false
+        if ($err)       { Show-Bubble ('切换失败：' + $err) -source 'manual'; return }
+        if (-not $r)    { Show-Bubble '切换失败：没有返回结果' -source 'manual'; return }
+        if ($r.offline) { Show-Bubble 'Syncthing 没在跑，先把它启动起来' -source 'manual'; return }
+        if (-not $r.ok) { Show-Bubble ('切换失败：' + $r.error) -source 'manual'; return }
+        if ($r.paused)  { Show-Bubble '⏸ 已暂停 Oracle-Sync 同步' -source 'manual' }
+        else            { Show-Bubble '▶ 已恢复 Oracle-Sync 同步' -source 'manual' }
         try { Pump-SyncPoll } catch {}
-    } catch {
-        Show-Bubble ("切换失败：" + $_.Exception.Message)
     }
 })
 
-# 打开菜单前刷新"暂停 / 恢复"标签
+# 打开菜单前刷新动态内容：状态信息行、暂停/恢复、勿扰剩余时间
 $menu.Add_Opened({
+    $info = if ($script:syncLast -and $script:syncLast.tip) { $script:syncLast.tip } else { 'Syncthing 状态：检测中…' }
+    $lastLine = Get-LastSyncLine
+    if ($lastLine) { $info += "`n" + $lastLine }
+    $miInfo.Header = $info
     if ($script:syncLastKind -eq 'paused') { $miPause.Header = '恢复同步'; $miPause.Icon = [string][char]0xE768 }
     else                                    { $miPause.Header = '暂停同步'; $miPause.Icon = [string][char]0xE769 }
+    if (Test-Dnd) {
+        $left = [Math]::Ceiling(($script:dndUntil - [DateTime]::Now).TotalMinutes)
+        $miDnd.Header = "结束勿扰（剩 $left 分钟）"
+    } else { $miDnd.Header = '勿扰 1 小时' }
 })
-
-# 单实例：互斥锁
-$mutex = New-Object System.Threading.Mutex($false, 'Global\OracleSyncPet')
-if (-not $mutex.WaitOne(0)) { Write-ExitLog 'mutex busy, exit'; return }
+$menu.Add_Closed({ Request-HideDocked })
 
 # 窗口关闭与未处理异常的记录（只记录，不改变异常是否终止进程的行为）
 $win.Add_Closed({ Write-ExitLog 'window closed' })
@@ -899,7 +1269,8 @@ try {
 } finally {
     Write-ExitLog 'finally reached'
     Hide-WaterFilter
-    foreach ($t in @($waterTimer, $waterFilterTimer, $timer, $notifyPoll, $syncTimer, $topmostTimer)) {
+    foreach ($t in @($waterTimer, $waterFilterTimer, $timer, $notifyPoll, $syncTimer, $topmostTimer,
+                     $bgTimer, $conflictTimer, $conflictFirst, $slideTimer, $dockHideTimer)) {
         if ($t) { $t.Stop() }
     }
     $mutex.ReleaseMutex()
