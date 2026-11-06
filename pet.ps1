@@ -40,7 +40,30 @@ if (Test-Path $stateFile) {
 }
 
 # region UI-XAML（preview-ui.ps1 会截取 region 到 endregion 之间的代码离屏渲染，改动时保持自包含）
-# ---------- 选择形象：优先 pet.png，否则 emoji ----------
+# ---------- 皮肤配置列表（共 5 款皮肤） ----------
+$skinDefs = @(
+    # Dot：同步状态圆点左上角位置（96×96 形象框内）。横图皮肤放在右下角牌子外侧，避免挡住文字。
+    [pscustomobject]@{ Id = 'default';     Name = '默认形象';   File = 'pet.png';          Dot = '74,54,0,0' },
+    [pscustomobject]@{ Id = 'tgood_board'; Name = '特锐德牌子'; File = '特锐德牌子.png';   Dot = '80,64,0,0' },
+    [pscustomobject]@{ Id = 'tgood_robot'; Name = '特锐德机器人'; File = '特锐德机器人.png'; Dot = '80,64,0,0' },
+    [pscustomobject]@{ Id = 'teld_robot';  Name = '特来电机器人'; File = '特来电机器人.png'; Dot = '80,64,0,0' },
+    [pscustomobject]@{ Id = 'teld_board';  Name = '特来电牌子'; File = '特来电牌子.png';   Dot = '80,64,0,0' }
+)
+$script:currentSkinId = if ($pos -and $pos.PSObject.Properties['Skin'] -and $pos.Skin) { [string]$pos.Skin } else { 'default' }
+$currentSkinDef = $skinDefs | Where-Object { $_.Id -eq $script:currentSkinId } | Select-Object -First 1
+if (-not $currentSkinDef) { $currentSkinDef = $skinDefs[0]; $script:currentSkinId = $currentSkinDef.Id }
+$skinBaseDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($petPng) { Split-Path -Parent $petPng } else { (Get-Location).Path }
+$currentSkinFile = Join-Path $skinBaseDir $currentSkinDef.File
+
+# ---------- 桌宠大小（整体缩放倍数，存 state.json 的 Scale 字段） ----------
+$sizeMin = 0.5; $sizeMax = 3.0
+$script:petSize = 1.0
+if ($pos -and $pos.PSObject.Properties['Scale'] -and $pos.Scale) {
+    try { $script:petSize = [Math]::Min($sizeMax, [Math]::Max($sizeMin, [double]$pos.Scale)) } catch {}
+}
+$sizeXaml = ([string]$script:petSize).Replace(',', '.')
+
+# ---------- 选择形象：优先皮肤图片，否则 emoji ----------
 $transformBlock = @"
       <TransformGroup>
         <ScaleTransform     x:Name="PetScale"   ScaleX="1" ScaleY="1"/>
@@ -49,14 +72,24 @@ $transformBlock = @"
         <TranslateTransform x:Name="PetTrans"   X="0" Y="0"/>
       </TransformGroup>
 "@
-# 不同形象的可见主体位置不同：pet.png 上下各有透明留白，阴影、状态点、气泡都贴着可见主体放。
-if (Test-Path $petPng) {
+# 不同形象的可见主体位置不同：图片上下各有留白，阴影、状态点、气泡都贴着可见主体放。
+if (Test-Path $currentSkinFile) {
+    $shadowXaml   = 'VerticalAlignment="Top" Margin="0,69,0,0"'
+    $dotXaml      = 'HorizontalAlignment="Left" VerticalAlignment="Top" Margin="{0}"' -f $currentSkinDef.Dot
+    $bubbleOffset = 20
+    $bodyXaml = @"
+    <Image x:Name="Pet" Source="$([Uri]::new($currentSkinFile).AbsoluteUri)" Width="96" Height="96" Cursor="Hand"
+           Stretch="Uniform" RenderTransformOrigin="0.5,0.5">
+      <Image.RenderTransform>$transformBlock</Image.RenderTransform>
+    </Image>
+"@
+} elseif ($petPng -and (Test-Path $petPng)) {
     $shadowXaml   = 'VerticalAlignment="Top" Margin="0,69,0,0"'
     $dotXaml      = 'HorizontalAlignment="Left" VerticalAlignment="Top" Margin="74,54,0,0"'
     $bubbleOffset = 20
     $bodyXaml = @"
     <Image x:Name="Pet" Source="$([Uri]::new($petPng).AbsoluteUri)" Width="96" Height="96" Cursor="Hand"
-           RenderTransformOrigin="0.5,0.5">
+           Stretch="Uniform" RenderTransformOrigin="0.5,0.5">
       <Image.RenderTransform>$transformBlock</Image.RenderTransform>
     </Image>
 "@
@@ -77,7 +110,7 @@ $xaml = @"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         Topmost="True" ShowInTaskbar="False" SizeToContent="WidthAndHeight"
-        Title="OracleSyncPet" ToolTip="左键拖动 · 点击打开 Oracle-Sync · 右键菜单">
+        Title="OracleSyncPet" ToolTip="左键拖动 · 右键菜单">
   <Window.Resources>
     <!-- 统一的深色圆角提示框（窗口提示与状态点提示共用） -->
     <Style TargetType="ToolTip">
@@ -98,6 +131,7 @@ $xaml = @"
     </Style>
   </Window.Resources>
   <Grid Margin="8">
+    <Grid.LayoutTransform><ScaleTransform x:Name="SizeScale" ScaleX="$sizeXaml" ScaleY="$sizeXaml"/></Grid.LayoutTransform>
     <Ellipse x:Name="GroundShadow" Width="64" Height="12" HorizontalAlignment="Center"
              $shadowXaml IsHitTestVisible="False" RenderTransformOrigin="0.5,0.5">
       <Ellipse.Fill>
@@ -172,15 +206,32 @@ $menuXaml = @"
                 <Grid.ColumnDefinitions>
                   <ColumnDefinition Width="26"/>
                   <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="16"/>
                 </Grid.ColumnDefinitions>
                 <TextBlock x:Name="Ico" Text="{Binding Icon, RelativeSource={RelativeSource TemplatedParent}}"
                            FontFamily="Segoe MDL2 Assets" FontSize="14" Foreground="#FF6B7280"
                            VerticalAlignment="Center"/>
                 <ContentPresenter Grid.Column="1" ContentSource="Header" RecognizesAccessKey="True"
                                   VerticalAlignment="Center"/>
+                <TextBlock Grid.Column="2" x:Name="Arrow" Text="&#xE76C;" FontFamily="Segoe MDL2 Assets"
+                           FontSize="10" Foreground="#FF9CA3AF" VerticalAlignment="Center" Visibility="Collapsed"/>
+                <Popup x:Name="PART_Popup" AllowsTransparency="True" Focusable="False"
+                       IsOpen="{Binding IsSubmenuOpen, RelativeSource={RelativeSource TemplatedParent}}"
+                       Placement="Right" HorizontalOffset="-4" VerticalOffset="-5">
+                  <Border Background="#FFFFFFFF" BorderBrush="#FFE4E6EB" BorderThickness="1"
+                          CornerRadius="10" Padding="0,5" Margin="10" MinWidth="160">
+                    <Border.Effect>
+                      <DropShadowEffect BlurRadius="16" ShadowDepth="3" Direction="270" Opacity="0.18"/>
+                    </Border.Effect>
+                    <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Cycle"/>
+                  </Border>
+                </Popup>
               </Grid>
             </Border>
             <ControlTemplate.Triggers>
+              <Trigger Property="HasItems" Value="True">
+                <Setter TargetName="Arrow" Property="Visibility" Value="Visible"/>
+              </Trigger>
               <Trigger Property="IsHighlighted" Value="True">
                 <Setter TargetName="Bd" Property="Background" Value="#FFF1F3F6"/>
                 <Setter TargetName="Ico" Property="Foreground" Value="#FF3B82F6"/>
@@ -263,7 +314,7 @@ if ($pos.PSObject.Properties['Dock'] -and $pos.Dock) { $script:dock = [string]$p
 function Save-PetState {
     $left = $win.Left
     if ($script:dock) { $left = Get-DockX $script:dock $false }   # 贴边时总是记录"藏起来"的位置
-    @{ Left = $left; Top = $win.Top; Dock = $script:dock } | ConvertTo-Json |
+    @{ Left = $left; Top = $win.Top; Dock = $script:dock; Skin = $script:currentSkinId; Scale = $script:petSize } | ConvertTo-Json |
         Set-Content -Path $stateFile -Encoding UTF8
 }
 
@@ -408,12 +459,11 @@ $win.Add_MouseLeftButtonUp({
         # 点状态小圆点：打开 Syncthing 网页管理界面
         Start-Process 'http://127.0.0.1:8384/'
     } else {
-        # 按一下：缩放动画 + 打开文件夹
+        # 按一下：缩放动画
         $pop = New-Object System.Windows.Media.Animation.DoubleAnimation 0.75, 1.0, ([TimeSpan]::FromMilliseconds(220))
         $pop.EasingFunction = New-Object System.Windows.Media.Animation.BackEase -Property @{ Amplitude = 1.5; EasingMode = 'EaseOut' }
         $actScale.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleXProperty, $pop)
         $actScale.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleYProperty, $pop)
-        Open-SyncFolder
     }
 })
 
@@ -465,17 +515,125 @@ $miWaterDone.IsEnabled = $false
 $miSnooze = New-MenuItem '5 分钟后再提醒' 0xE823
 $miSnooze.IsEnabled = $false
 $miDnd = New-MenuItem '勿扰 1 小时' 0xE708
+
+# ---------- 切换皮肤菜单项与子项 ----------
+$miSkin = New-MenuItem '切换皮肤' 0xE790
+$script:skinMenuItems = @{}
+foreach ($s in $skinDefs) {
+    $subMi = New-Object System.Windows.Controls.MenuItem
+    $subMi.Header = $s.Name
+    $subMi.Tag    = $s.Id
+    $subMi.Add_Click({
+        param($sender, $e)
+        Set-PetSkin $sender.Tag
+    })
+    $script:skinMenuItems[$s.Id] = $subMi
+    [void]$miSkin.Items.Add($subMi)
+}
+function Update-SkinMenu {
+    if (-not $script:skinMenuItems) { return }
+    foreach ($id in $script:skinMenuItems.Keys) {
+        $item = $script:skinMenuItems[$id]
+        if ($id -eq $script:currentSkinId) {
+            $item.Icon = [string][char]0xE73E
+        } else {
+            $item.Icon = ''
+        }
+    }
+}
+Update-SkinMenu
+
+# ---------- 调节大小菜单项与子项 ----------
+$miSize = New-MenuItem '调节大小' 0xE740
+$script:sizeMenuItems = @{}
+foreach ($p in @(@('小', 0.75), @('标准', 1.0), @('大', 1.25), @('特大', 1.5), @('超大', 2.0))) {
+    $subMi = New-Object System.Windows.Controls.MenuItem
+    $subMi.Header = '{0}（{1}%）' -f $p[0], [int]($p[1] * 100)
+    $subMi.Tag    = [double]$p[1]
+    $subMi.Add_Click({ param($sender, $e) Set-PetSize ([double]$sender.Tag) })
+    $script:sizeMenuItems[[double]$p[1]] = $subMi
+    [void]$miSize.Items.Add($subMi)
+}
+$miSizeHint = New-Object System.Windows.Controls.MenuItem
+$miSizeHint.Header = '按住 Ctrl 滚动滚轮可微调'
+$miSizeHint.IsEnabled = $false
+[void]$miSize.Items.Add($miSizeHint)
+function Update-SizeMenu {
+    if (-not $script:sizeMenuItems) { return }
+    foreach ($k in $script:sizeMenuItems.Keys) {
+        $script:sizeMenuItems[$k].Icon = if ([Math]::Abs($k - $script:petSize) -lt 0.001) { [string][char]0xE73E } else { '' }
+    }
+    $miSize.Header = '调节大小（当前 {0}%）' -f [int][Math]::Round($script:petSize * 100)
+}
+Update-SizeMenu
+
 foreach ($it in @(
     $miInfo, 'sep',
     $miOpen, $miWeb, 'sep',
     $miSync, $miPause, $miConflict, 'sep',
+    $miSkin, $miSize, 'sep',
     $miWater, $miWaterDone, $miSnooze, $miDnd, 'sep',
     $miReset, $miExit)) {
     if ($it -is [string]) { [void]$menu.Items.Add((New-Object System.Windows.Controls.Separator)) }
     else { [void]$menu.Items.Add($it) }
 }
 # endregion UI-MENU
+
+# ---------- 动态切换皮肤 ----------
+function Set-PetSkin([string]$skinId) {
+    $def = $skinDefs | Where-Object { $_.Id -eq $skinId } | Select-Object -First 1
+    if (-not $def) { return }
+    $baseDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($petPng) { Split-Path -Parent $petPng } else { (Get-Location).Path }
+    $path = Join-Path $baseDir $def.File
+    if (-not (Test-Path $path)) {
+        Show-Bubble "找不到皮肤文件：$($def.File)" -source 'manual'
+        return
+    }
+    try {
+        $bmp = New-Object System.Windows.Media.Imaging.BitmapImage
+        $bmp.BeginInit()
+        $bmp.UriSource = [Uri]::new($path)
+        $bmp.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+        $bmp.EndInit()
+        $bmp.Freeze()
+        $pet.Source = $bmp
+        if ($def.Dot) { $m = [double[]]($def.Dot -split ','); $statusDot.Margin = New-Object System.Windows.Thickness($m[0], $m[1], $m[2], $m[3]) }
+        $script:currentSkinId = $skinId
+        Save-PetState
+        Update-SkinMenu
+        Show-Bubble "已切换皮肤：$($def.Name)" -source 'manual'
+    } catch {
+        Show-Bubble "切换皮肤失败：$($_.Exception.Message)" -source 'manual'
+    }
+}
 $win.ContextMenu = $menu
+
+# ---------- 调节大小 ----------
+# 整体缩放 Grid 的 LayoutTransform，SizeToContent 让窗口跟着变大变小；以脚底中点为锚点，
+# 改大小时桌宠"站"在原地不跳位。贴边状态下重新按新宽度计算贴边位置。
+$sizeScale = $win.FindName('SizeScale')
+function Set-PetSize([double]$size) {
+    $size = [Math]::Round([Math]::Min($sizeMax, [Math]::Max($sizeMin, $size)), 2)
+    if ([Math]::Abs($size - $script:petSize) -lt 0.001) { return }
+    $cx = $win.Left + $win.ActualWidth / 2
+    $bottom = $win.Top + $win.ActualHeight
+    $script:petSize = $size
+    $sizeScale.ScaleX = $size; $sizeScale.ScaleY = $size
+    $win.UpdateLayout()
+    if ($script:dock) { $win.Left = Get-DockX $script:dock $script:dockShown }
+    else { $win.Left = $cx - $win.ActualWidth / 2 }
+    $win.Top = $bottom - $win.ActualHeight
+    Update-SizeMenu
+    Save-PetState
+}
+# Ctrl + 滚轮：每格 10%
+$win.Add_PreviewMouseWheel({
+    param($s, $e)
+    if (([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Control) -eq 0) { return }
+    $step = if ($e.Delta -gt 0) { 0.1 } else { -0.1 }
+    try { Set-PetSize ($script:petSize + $step) } catch {}
+    $e.Handled = $true
+})
 
 # ---------- 闲置时的呼吸动画 ----------
 $breathe = New-Object System.Windows.Media.Animation.DoubleAnimation
@@ -1068,7 +1226,27 @@ function Set-AlwaysOnTop {
 }
 $topmostTimer = New-Object System.Windows.Threading.DispatcherTimer
 $topmostTimer.Interval = [TimeSpan]::FromSeconds(2)
+# 2026-11-06 实测：进程还活着、气泡还能弹，但主窗口被外部程序 ShowWindow(SW_HIDE) 藏掉了
+# （IsWindowVisible=False，WPF 的 Visibility 仍是 Visible，所以 $win.Show() 无效）。
+# 这里按原生句柄检查，被藏/被最小化就用 SW_SHOWNOACTIVATE 放回来，并记下当时的前台程序方便追查。
+function Ensure-Visible {
+    if (-not ('OracleSyncWin32' -as [type]) -or -not ([OracleSyncWin32].GetMethod('IsWindowVisible'))) { return }
+    $h = (New-Object System.Windows.Interop.WindowInteropHelper $win).Handle
+    if ($h -eq [IntPtr]::Zero) { return }
+    $hidden = -not [OracleSyncWin32]::IsWindowVisible($h)
+    $iconic = [OracleSyncWin32]::IsIconic($h)
+    if (-not $hidden -and -not $iconic) { return }
+    $fgName = ''
+    try {
+        $fg = [OracleSyncWin32]::GetForegroundWindow(); $fp = 0
+        [void][OracleSyncWin32]::GetWindowThreadProcessId($fg, [ref]$fp)
+        $fgName = (Get-Process -Id $fp -ErrorAction SilentlyContinue).ProcessName
+    } catch {}
+    [void][OracleSyncWin32]::ShowWindow($h, 4)   # SW_SHOWNOACTIVATE
+    Write-ExitLog ("window restored (hidden=$hidden iconic=$iconic foreground=$fgName)")
+}
 $topmostTimer.Add_Tick({
+    try { Ensure-Visible } catch {}
     try { Set-AlwaysOnTop } catch {}
     try { Ensure-OnScreen } catch {}   # 显示器变化后把跑出屏幕的桌宠拉回来
 })
@@ -1245,8 +1423,10 @@ $miPause.Add_Click({
     }
 })
 
-# 打开菜单前刷新动态内容：状态信息行、暂停/恢复、勿扰剩余时间
+# 打开菜单前刷新动态内容：状态信息行、暂停/恢复、勿扰剩余时间、皮肤勾选
 $menu.Add_Opened({
+    Update-SkinMenu
+    Update-SizeMenu
     $info = if ($script:syncLast -and $script:syncLast.tip) { $script:syncLast.tip } else { 'Syncthing 状态：检测中…' }
     $lastLine = Get-LastSyncLine
     if ($lastLine) { $info += "`n" + $lastLine }
