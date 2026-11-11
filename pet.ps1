@@ -1075,18 +1075,25 @@ $pollScript = {
     if (-not $apiKey -or -not $folderId) { return @{ kind = 'unknown'; tip = '未找到 Syncthing 配置' } }
     if (-not (Test-Port))                { return @{ kind = 'offline'; tip = 'Syncthing 未运行（127.0.0.1:8384 无响应）' } }
     $headers = @{ 'X-API-Key' = $apiKey }
+    # Windows PowerShell 5.1 的 Invoke-RestMethod 对不带 charset 的 JSON（Syncthing 就是）会按
+    # Latin-1 解码，中文文件名全成乱码（"新建…" → "æ°å»º…"）。这里统一拿原始字节按 UTF-8 解码。
+    function Invoke-SyncJson([string]$Uri, [int]$TimeoutSec = 2) {
+        $resp = Invoke-WebRequest -Uri $Uri -Headers $headers -TimeoutSec $TimeoutSec -UseBasicParsing
+        $bytes = if ($resp.Content -is [byte[]]) { $resp.Content } else { $resp.RawContentStream.ToArray() }
+        return ([Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json)
+    }
     try {
-        $fcfg = Invoke-RestMethod -Uri "http://127.0.0.1:8384/rest/config/folders/$folderId" -Headers $headers -TimeoutSec 2
+        $fcfg = Invoke-SyncJson "http://127.0.0.1:8384/rest/config/folders/$folderId"
     } catch { return @{ kind = 'error'; tip = ('Syncthing 无响应：' + $_.Exception.Message) } }
     if ($fcfg.paused) { return @{ kind = 'paused'; tip = '已暂停同步（右键 → 暂停 / 恢复同步 可恢复）' } }
     try {
-        $st = Invoke-RestMethod -Uri "http://127.0.0.1:8384/rest/db/status?folder=$folderId" -Headers $headers -TimeoutSec 2
-        $cn = Invoke-RestMethod -Uri 'http://127.0.0.1:8384/rest/system/connections' -Headers $headers -TimeoutSec 2
+        $st = Invoke-SyncJson "http://127.0.0.1:8384/rest/db/status?folder=$folderId"
+        $cn = Invoke-SyncJson 'http://127.0.0.1:8384/rest/system/connections'
     } catch { return @{ kind = 'error'; tip = ('Syncthing 无响应：' + $_.Exception.Message) } }
     # 最近一次收到/改动的文件（可选信息，取不到不影响状态判断）
     $lastAt = $null; $lastName = $null
     try {
-        $fs = Invoke-RestMethod -Uri 'http://127.0.0.1:8384/rest/stats/folder' -Headers $headers -TimeoutSec 2
+        $fs = Invoke-SyncJson 'http://127.0.0.1:8384/rest/stats/folder'
         $lf = $fs.$folderId.lastFile
         if ($lf -and $lf.at) { $lastAt = [string]$lf.at; $lastName = [string]$lf.filename }
     } catch {}
