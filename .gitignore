@@ -6,6 +6,13 @@
 AGENTS.md
 CLAUDE.md
 
+# Syncthing artifacts (this repo lives inside a synced folder)
+~syncthing~*
+*.sync-conflict-*
+.sync-ignore
+.stfolder/
+.stversions/
+
 # Windows / editor noise
 Thumbs.db
 Desktop.ini
